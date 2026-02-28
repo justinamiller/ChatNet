@@ -7,6 +7,10 @@ namespace ChatNet.Core.Tensors.Quantization
     /// <summary>
     /// Q4_0 dequantization: blocks of 32 values.
     /// Each block = 2 bytes (half-float scale) + 16 bytes (32 x 4-bit packed) = 18 bytes.
+    ///
+    /// GGML packing order per block of 16 data bytes:
+    ///   positions  0..15 = low  nibble of bytes 0..15  (qs[j] &amp; 0x0F)
+    ///   positions 16..31 = high nibble of bytes 0..15  (qs[j] >> 4)
     /// </summary>
     public static class DequantQ4_0
     {
@@ -19,9 +23,6 @@ namespace ChatNet.Core.Tensors.Quantization
         /// <summary>
         /// Dequantize Q4_0 data into a float output buffer.
         /// </summary>
-        /// <param name="quantizedData">Raw Q4_0 bytes.</param>
-        /// <param name="output">Float output buffer (must be large enough for all elements).</param>
-        /// <param name="elementCount">Number of elements to dequantize.</param>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static void Dequantize(ReadOnlySpan<byte> quantizedData, Span<float> output, int elementCount)
         {
@@ -35,34 +36,35 @@ namespace ChatNet.Core.Tensors.Quantization
                 float scale = HalfToFloat(quantizedData[srcOffset], quantizedData[srcOffset + 1]);
                 srcOffset += 2;
 
-                // Read 16 bytes of packed 4-bit values (32 values)
+                // Unpack 16 bytes into 32 float values using GGML nibble order:
+                //   first 16 values  from low nibbles  (qs[j] & 0x0F) - 8
+                //   next  16 values  from high nibbles (qs[j] >> 4)   - 8
                 int remaining = elementCount - dstOffset;
-                int count = remaining < BlockSize ? remaining : BlockSize;
+                int half = remaining < 16 ? remaining : 16;
 
-                for (int i = 0; i < count; i++)
+                for (int j = 0; j < half; j++)
                 {
-                    byte packed = quantizedData[srcOffset + i / 2];
-                    int quant;
-                    if ((i & 1) == 0)
-                    {
-                        quant = packed & 0x0F;
-                    }
-                    else
-                    {
-                        quant = (packed >> 4) & 0x0F;
-                    }
-                    // Center around zero: subtract 8
-                    output[dstOffset + i] = (quant - 8) * scale;
+                    int low = (quantizedData[srcOffset + j] & 0x0F) - 8;
+                    output[dstOffset + j] = low * scale;
+                }
+
+                int secondHalf = remaining < BlockSize ? (remaining > 16 ? remaining - 16 : 0) : 16;
+                for (int j = 0; j < secondHalf; j++)
+                {
+                    int high = ((quantizedData[srcOffset + j] >> 4) & 0x0F) - 8;
+                    output[dstOffset + 16 + j] = high * scale;
                 }
 
                 srcOffset += 16; // 16 bytes of packed data per block
-                dstOffset += count;
+                dstOffset += half + secondHalf;
             }
         }
 
         /// <summary>
         /// Fused dequant + dot product for a single Q4_0 row against a float vector.
-        /// This is the hottest path - avoids materializing the full dequantized row.
+        /// This is the hottest path — avoids materializing the full dequantized row.
+        ///
+        /// GGML nibble order: low nibbles → positions 0..15, high nibbles → positions 16..31.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe float DotProduct(byte* quantizedRow, float* input, int elementCount)
@@ -78,19 +80,26 @@ namespace ChatNet.Core.Tensors.Quantization
                 float scale = HalfToFloat(quantizedRow[srcOffset], quantizedRow[srcOffset + 1]);
                 srcOffset += 2;
 
-                // Process 32 elements: 16 bytes of packed data
+                // Accumulate dot product with correct nibble-to-position mapping
                 float blockSum = 0f;
-                for (int i = 0; i < 16; i++)
+
+                // Low nibbles: positions 0..15
+                for (int j = 0; j < 16; j++)
                 {
-                    byte packed = quantizedRow[srcOffset + i];
-                    int low = packed & 0x0F;
-                    int high = (packed >> 4) & 0x0F;
-                    blockSum += (low - 8) * input[inputIdx];
-                    blockSum += (high - 8) * input[inputIdx + 1];
-                    inputIdx += 2;
+                    int low = (quantizedRow[srcOffset + j] & 0x0F) - 8;
+                    blockSum += low * input[inputIdx + j];
                 }
+
+                // High nibbles: positions 16..31
+                for (int j = 0; j < 16; j++)
+                {
+                    int high = ((quantizedRow[srcOffset + j] >> 4) & 0x0F) - 8;
+                    blockSum += high * input[inputIdx + 16 + j];
+                }
+
                 sum += blockSum * scale;
                 srcOffset += 16;
+                inputIdx += 32;
             }
 
             return sum;
