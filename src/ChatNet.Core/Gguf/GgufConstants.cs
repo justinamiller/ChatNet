@@ -5,8 +5,8 @@ namespace ChatNet.Core.Gguf
     /// </summary>
     internal static class GgufConstants
     {
-        /// <summary>GGUF magic number: "GGUF" in little-endian.</summary>
-        public const uint Magic = 0x46475547;
+        /// <summary>GGUF magic number: "GGUF" in ASCII read as little-endian uint32.</summary>
+        public const uint Magic = 0x46554747;
 
         /// <summary>Expected GGUF version.</summary>
         public const uint ExpectedVersion = 3;
