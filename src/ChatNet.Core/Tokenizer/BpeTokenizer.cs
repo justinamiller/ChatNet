@@ -25,6 +25,21 @@ namespace ChatNet.Core.Tokenizer
         private readonly int[] _specialTokenIds;
         private readonly int _specialTokenCount;
 
+        // Cached single-char strings to avoid Substring(i, 1) allocations in BPE init loop.
+        // Covers ASCII + SentencePiece ▁ (U+2581). Indexed by char value for chars < 128,
+        // with ▁ at index 128.
+        private static readonly string[] s_charStrings = BuildCharStringCache();
+
+        private static string[] BuildCharStringCache()
+        {
+            // 129 entries: 0..127 for ASCII, 128 for ▁
+            var cache = new string[129];
+            for (int i = 0; i < 128; i++)
+                cache[i] = ((char)i).ToString();
+            cache[128] = "\u2581";
+            return cache;
+        }
+
         public int VocabSize => _vocab.Size;
         public int BosToken => _bosToken;
         public int EosToken => _eosToken;
@@ -220,12 +235,21 @@ namespace ChatNet.Core.Tokenizer
             // SentencePiece: prepend ▁, replace spaces with ▁
             string processed = "\u2581" + text.Replace(" ", "\u2581");
 
-            // Build initial symbol list from individual characters
+            // Build initial symbol list from individual characters.
+            // Uses cached single-char strings to avoid Substring allocations for ASCII/▁.
             var symbols = new List<string>(processed.Length);
             int charIdx = 0;
             while (charIdx < processed.Length)
             {
-                string ch = processed.Substring(charIdx, 1);
+                char c = processed[charIdx];
+                string ch;
+                if (c < 128)
+                    ch = s_charStrings[c];
+                else if (c == '\u2581')
+                    ch = s_charStrings[128];
+                else
+                    ch = processed.Substring(charIdx, 1);
+
                 if (_vocab.Contains(ch))
                 {
                     symbols.Add(ch);
@@ -243,19 +267,19 @@ namespace ChatNet.Core.Tokenizer
                 charIdx++;
             }
 
-            // BPE merge loop: repeatedly find the best merge (highest score)
+            // BPE merge loop: repeatedly find the best merge (highest score).
+            // Uses allocation-free GetMergeTokenId to avoid string concat per candidate.
             bool merged = true;
             while (merged && symbols.Count > 1)
             {
                 merged = false;
                 float bestScore = float.NegativeInfinity;
                 int bestIdx = -1;
-                string bestMerge = "";
+                int bestTokenId = -1;
 
                 for (int i = 0; i < symbols.Count - 1; i++)
                 {
-                    string candidate = symbols[i] + symbols[i + 1];
-                    int tokenId = _vocab.GetTokenId(candidate);
+                    int tokenId = _vocab.GetMergeTokenId(symbols[i], symbols[i + 1]);
                     if (tokenId >= 0)
                     {
                         float score = _vocab.Scores[tokenId];
@@ -263,14 +287,14 @@ namespace ChatNet.Core.Tokenizer
                         {
                             bestScore = score;
                             bestIdx = i;
-                            bestMerge = candidate;
+                            bestTokenId = tokenId;
                         }
                     }
                 }
 
                 if (bestIdx >= 0)
                 {
-                    symbols[bestIdx] = bestMerge;
+                    symbols[bestIdx] = _vocab.Tokens[bestTokenId];
                     symbols.RemoveAt(bestIdx + 1);
                     merged = true;
                 }
