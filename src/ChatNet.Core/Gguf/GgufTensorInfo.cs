@@ -72,6 +72,41 @@ namespace ChatNet.Core.Gguf
                     case GgmlType.Q8K:
                         blocks = (elements + 255) / 256;
                         return blocks * 292;
+                    case GgmlType.Q8_1:
+                        blocks = (elements + 31) / 32;
+                        return blocks * 36; // 4 scale + 32 data
+                    case GgmlType.IQ4NL:
+                        blocks = (elements + 31) / 32;
+                        return blocks * 18; // Same layout as Q4_0
+                    case GgmlType.IQ4XS:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 136;
+                    case GgmlType.IQ3S:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 110;
+                    case GgmlType.IQ3XXS:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 98;
+                    case GgmlType.IQ2XS:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 74;
+                    case GgmlType.IQ2XXS:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 66;
+                    case GgmlType.IQ2S:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 82;
+                    case GgmlType.IQ1S:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 50;
+                    case GgmlType.IQ1M:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 56;
+                    case GgmlType.I8: return elements;
+                    case GgmlType.I16: return elements * 2;
+                    case GgmlType.I32: return elements * 4;
+                    case GgmlType.I64: return elements * 8;
+                    case GgmlType.F64: return elements * 8;
                     default:
                         return elements * 4; // fallback
                 }

@@ -373,20 +373,6 @@ namespace ChatNet.Core.Models.Llama
                 int offset = tokenId * dim;
                 allEmb.Slice(offset, dim).CopyTo(output);
             }
-            else if (_weights.EmbeddingType == GgmlType.Q4_0)
-            {
-                int blocksPerRow = dim / DequantQ4_0.BlockSize;
-                int bytesPerRow = blocksPerRow * DequantQ4_0.BytesPerBlock;
-                int rowOffset = tokenId * bytesPerRow;
-                DequantQ4_0.Dequantize(embData.Slice(rowOffset, bytesPerRow), output, dim);
-            }
-            else if (_weights.EmbeddingType == GgmlType.Q6K)
-            {
-                int blocksPerRow = dim / DequantQ6K.BlockSize;
-                int bytesPerRow = blocksPerRow * DequantQ6K.BytesPerBlock;
-                int rowOffset = tokenId * bytesPerRow;
-                DequantQ6K.Dequantize(embData.Slice(rowOffset, bytesPerRow), output, dim);
-            }
             else if (_weights.EmbeddingType == GgmlType.F16)
             {
                 int offset = tokenId * dim * 2;
@@ -397,7 +383,86 @@ namespace ChatNet.Core.Models.Llama
             }
             else
             {
-                throw new NotSupportedException("Unsupported embedding type: " + _weights.EmbeddingType);
+                // Generic dequantization path for all quantized types
+                GetDequantInfo(_weights.EmbeddingType, out int blockSize, out int bytesPerBlock,
+                    out DequantizeDelegate dequant);
+                int blocksPerRow = dim / blockSize;
+                int bytesPerRow = blocksPerRow * bytesPerBlock;
+                int rowOffset = tokenId * bytesPerRow;
+                dequant(embData.Slice(rowOffset, bytesPerRow), output, dim);
+            }
+        }
+
+        private delegate void DequantizeDelegate(ReadOnlySpan<byte> data, Span<float> output, int count);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void GetDequantInfo(GgmlType type, out int blockSize, out int bytesPerBlock,
+            out DequantizeDelegate dequant)
+        {
+            switch (type)
+            {
+                case GgmlType.Q4_0:
+                    blockSize = DequantQ4_0.BlockSize; bytesPerBlock = DequantQ4_0.BytesPerBlock;
+                    dequant = DequantQ4_0.Dequantize; return;
+                case GgmlType.Q4_1:
+                    blockSize = DequantQ4_1.BlockSize; bytesPerBlock = DequantQ4_1.BytesPerBlock;
+                    dequant = DequantQ4_1.Dequantize; return;
+                case GgmlType.Q5_0:
+                    blockSize = DequantQ5_0.BlockSize; bytesPerBlock = DequantQ5_0.BytesPerBlock;
+                    dequant = DequantQ5_0.Dequantize; return;
+                case GgmlType.Q5_1:
+                    blockSize = DequantQ5_1.BlockSize; bytesPerBlock = DequantQ5_1.BytesPerBlock;
+                    dequant = DequantQ5_1.Dequantize; return;
+                case GgmlType.Q8_0:
+                    blockSize = DequantQ8_0.BlockSize; bytesPerBlock = DequantQ8_0.BytesPerBlock;
+                    dequant = DequantQ8_0.Dequantize; return;
+                case GgmlType.Q2K:
+                    blockSize = DequantQ2K.BlockSize; bytesPerBlock = DequantQ2K.BytesPerBlock;
+                    dequant = DequantQ2K.Dequantize; return;
+                case GgmlType.Q3K:
+                    blockSize = DequantQ3K.BlockSize; bytesPerBlock = DequantQ3K.BytesPerBlock;
+                    dequant = DequantQ3K.Dequantize; return;
+                case GgmlType.Q4K:
+                    blockSize = DequantQ4K.BlockSize; bytesPerBlock = DequantQ4K.BytesPerBlock;
+                    dequant = DequantQ4K.Dequantize; return;
+                case GgmlType.Q5K:
+                    blockSize = DequantQ5K.BlockSize; bytesPerBlock = DequantQ5K.BytesPerBlock;
+                    dequant = DequantQ5K.Dequantize; return;
+                case GgmlType.Q6K:
+                    blockSize = DequantQ6K.BlockSize; bytesPerBlock = DequantQ6K.BytesPerBlock;
+                    dequant = DequantQ6K.Dequantize; return;
+                case GgmlType.Q8K:
+                    blockSize = DequantQ8K.BlockSize; bytesPerBlock = DequantQ8K.BytesPerBlock;
+                    dequant = DequantQ8K.Dequantize; return;
+                case GgmlType.IQ4NL:
+                    blockSize = DequantIQ.IQ4NL.BlockSize; bytesPerBlock = DequantIQ.IQ4NL.BytesPerBlock;
+                    dequant = DequantIQ.IQ4NL.Dequantize; return;
+                case GgmlType.IQ4XS:
+                    blockSize = DequantIQ.IQ4XS.BlockSize; bytesPerBlock = DequantIQ.IQ4XS.BytesPerBlock;
+                    dequant = DequantIQ.IQ4XS.Dequantize; return;
+                case GgmlType.IQ3S:
+                    blockSize = DequantIQ.IQ3S.BlockSize; bytesPerBlock = DequantIQ.IQ3S.BytesPerBlock;
+                    dequant = DequantIQ.IQ3S.Dequantize; return;
+                case GgmlType.IQ3XXS:
+                    blockSize = DequantIQ.IQ3XXS.BlockSize; bytesPerBlock = DequantIQ.IQ3XXS.BytesPerBlock;
+                    dequant = DequantIQ.IQ3XXS.Dequantize; return;
+                case GgmlType.IQ2XS:
+                    blockSize = DequantIQ.IQ2XS.BlockSize; bytesPerBlock = DequantIQ.IQ2XS.BytesPerBlock;
+                    dequant = DequantIQ.IQ2XS.Dequantize; return;
+                case GgmlType.IQ2XXS:
+                    blockSize = DequantIQ.IQ2XXS.BlockSize; bytesPerBlock = DequantIQ.IQ2XXS.BytesPerBlock;
+                    dequant = DequantIQ.IQ2XXS.Dequantize; return;
+                case GgmlType.IQ2S:
+                    blockSize = DequantIQ.IQ2S.BlockSize; bytesPerBlock = DequantIQ.IQ2S.BytesPerBlock;
+                    dequant = DequantIQ.IQ2S.Dequantize; return;
+                case GgmlType.IQ1S:
+                    blockSize = DequantIQ.IQ1S.BlockSize; bytesPerBlock = DequantIQ.IQ1S.BytesPerBlock;
+                    dequant = DequantIQ.IQ1S.Dequantize; return;
+                case GgmlType.IQ1M:
+                    blockSize = DequantIQ.IQ1M.BlockSize; bytesPerBlock = DequantIQ.IQ1M.BytesPerBlock;
+                    dequant = DequantIQ.IQ1M.Dequantize; return;
+                default:
+                    throw new NotSupportedException("Unsupported embedding type: " + type);
             }
         }
 
@@ -405,23 +470,110 @@ namespace ChatNet.Core.Models.Llama
         private unsafe void MatVecMulByType(byte* weights, GgmlType type,
             ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim)
         {
-            if (type == GgmlType.Q4_0)
+            switch (type)
             {
-                TensorMath.MatVecMulQ4_0(weights, input, output, outDim, inDim);
+                case GgmlType.Q4_0:
+                    TensorMath.MatVecMulQ4_0(weights, input, output, outDim, inDim);
+                    return;
+                case GgmlType.Q6K:
+                    TensorMath.MatVecMulQ6K(weights, input, output, outDim, inDim);
+                    return;
+                case GgmlType.F32:
+                    TensorMath.MatVecMul(new ReadOnlySpan<float>(weights, outDim * inDim), input, output, outDim, inDim);
+                    return;
+                case GgmlType.F16:
+                    MatVecMulF16(weights, input, output, outDim, inDim);
+                    return;
+
+                // K-quant types with fused dot product
+                case GgmlType.Q4_1:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ4_1.BlockSize, DequantQ4_1.BytesPerBlock, &DequantQ4_1.DotProduct);
+                    return;
+                case GgmlType.Q5_0:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ5_0.BlockSize, DequantQ5_0.BytesPerBlock, &DequantQ5_0.DotProduct);
+                    return;
+                case GgmlType.Q5_1:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ5_1.BlockSize, DequantQ5_1.BytesPerBlock, &DequantQ5_1.DotProduct);
+                    return;
+                case GgmlType.Q8_0:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ8_0.BlockSize, DequantQ8_0.BytesPerBlock, &DequantQ8_0.DotProduct);
+                    return;
+                case GgmlType.Q2K:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ2K.BlockSize, DequantQ2K.BytesPerBlock, &DequantQ2K.DotProduct);
+                    return;
+                case GgmlType.Q3K:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ3K.BlockSize, DequantQ3K.BytesPerBlock, &DequantQ3K.DotProduct);
+                    return;
+                case GgmlType.Q4K:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ4K.BlockSize, DequantQ4K.BytesPerBlock, &DequantQ4K.DotProduct);
+                    return;
+                case GgmlType.Q5K:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ5K.BlockSize, DequantQ5K.BytesPerBlock, &DequantQ5K.DotProduct);
+                    return;
+                case GgmlType.Q8K:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantQ8K.BlockSize, DequantQ8K.BytesPerBlock, &DequantQ8K.DotProduct);
+                    return;
+
+                // IQ family types
+                case GgmlType.IQ4NL:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ4NL.BlockSize, DequantIQ.IQ4NL.BytesPerBlock, &DequantIQ.IQ4NL.DotProduct);
+                    return;
+                case GgmlType.IQ4XS:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ4XS.BlockSize, DequantIQ.IQ4XS.BytesPerBlock, &DequantIQ.IQ4XS.DotProduct);
+                    return;
+                case GgmlType.IQ3S:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ3S.BlockSize, DequantIQ.IQ3S.BytesPerBlock, &DequantIQ.IQ3S.DotProduct);
+                    return;
+                case GgmlType.IQ3XXS:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ3XXS.BlockSize, DequantIQ.IQ3XXS.BytesPerBlock, &DequantIQ.IQ3XXS.DotProduct);
+                    return;
+                case GgmlType.IQ2XS:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ2XS.BlockSize, DequantIQ.IQ2XS.BytesPerBlock, &DequantIQ.IQ2XS.DotProduct);
+                    return;
+                case GgmlType.IQ2XXS:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ2XXS.BlockSize, DequantIQ.IQ2XXS.BytesPerBlock, &DequantIQ.IQ2XXS.DotProduct);
+                    return;
+                case GgmlType.IQ2S:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ2S.BlockSize, DequantIQ.IQ2S.BytesPerBlock, &DequantIQ.IQ2S.DotProduct);
+                    return;
+                case GgmlType.IQ1S:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ1S.BlockSize, DequantIQ.IQ1S.BytesPerBlock, &DequantIQ.IQ1S.DotProduct);
+                    return;
+                case GgmlType.IQ1M:
+                    TensorMath.MatVecMulGeneric(weights, input, output, outDim, inDim,
+                        DequantIQ.IQ1M.BlockSize, DequantIQ.IQ1M.BytesPerBlock, &DequantIQ.IQ1M.DotProduct);
+                    return;
+
+                default:
+                    throw new NotSupportedException("Unsupported weight quantization type: " + type);
             }
-            else if (type == GgmlType.Q6K)
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static unsafe void MatVecMulF16(byte* weights, ReadOnlySpan<float> input,
+            Span<float> output, int outDim, int inDim)
+        {
+            float[] dequantBuf = ArrayPool<float>.Shared.Rent(inDim);
+            try
             {
-                TensorMath.MatVecMulQ6K(weights, input, output, outDim, inDim);
-            }
-            else if (type == GgmlType.F32)
-            {
-                ReadOnlySpan<float> fWeights = new ReadOnlySpan<float>(weights, outDim * inDim);
-                TensorMath.MatVecMul(fWeights, input, output, outDim, inDim);
-            }
-            else if (type == GgmlType.F16)
-            {
-                float[] dequantBuf = ArrayPool<float>.Shared.Rent(inDim);
-                try
+                fixed (float* pInput = input)
                 {
                     for (int row = 0; row < outDim; row++)
                     {
@@ -433,19 +585,15 @@ namespace ChatNet.Core.Models.Llama
                         float dot = 0f;
                         for (int i = 0; i < inDim; i++)
                         {
-                            dot += dequantBuf[i] * input[i];
+                            dot += dequantBuf[i] * pInput[i];
                         }
                         output[row] = dot;
                     }
                 }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(dequantBuf);
-                }
             }
-            else
+            finally
             {
-                throw new NotSupportedException("Unsupported weight quantization type: " + type);
+                ArrayPool<float>.Shared.Return(dequantBuf);
             }
         }
 
