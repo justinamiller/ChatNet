@@ -405,16 +405,18 @@ namespace ChatNet.Core.Tensors
         /// - Process Q and K heads with shared frequency computation.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        public static unsafe void ApplyRoPE(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase)
+        public static unsafe void ApplyRoPE(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase, int rotaryDim = 0)
         {
-            // Precompute: freq[i] = 1.0 / pow(freqBase, i / headDim)
-            //           = exp(-i / headDim * log(freqBase))
+            // rotaryDim <= 0 means full rotation (all headDim elements)
+            // Phi-3 uses partial RoPE: rotaryDim = headDim/2
+            if (rotaryDim <= 0) rotaryDim = headDim;
+
+            // Precompute: freq[i] = 1.0 / pow(freqBase, i / rotaryDim)
+            //           = exp(-i / rotaryDim * log(freqBase))
             // theta[i]  = position * freq[i]
-            // This replaces headDim/2 calls to MathF.Pow with headDim/2 calls to
-            // MathF.Exp using a linear progression, which is the same operation
-            // Pow does internally but we avoid the log() per call.
+            // For partial RoPE (Phi-3), rotaryDim < headDim; frequency formula uses rotaryDim.
             float negLogBase = -MathF.Log(freqBase);
-            float dimInv = 1.0f / headDim;
+            float dimInv = 1.0f / rotaryDim;
 
             fixed (float* pQ = q)
             fixed (float* pK = k)
@@ -423,7 +425,7 @@ namespace ChatNet.Core.Tensors
                 for (int h = 0; h < nHeads; h++)
                 {
                     float* vec = pQ + h * headDim;
-                    for (int i = 0; i < headDim; i += 2)
+                    for (int i = 0; i < rotaryDim; i += 2)
                     {
                         float theta = position * MathF.Exp(i * dimInv * negLogBase);
                         float cosTheta = MathF.Cos(theta);
@@ -440,7 +442,7 @@ namespace ChatNet.Core.Tensors
                 for (int h = 0; h < nKvHeads; h++)
                 {
                     float* vec = pK + h * headDim;
-                    for (int i = 0; i < headDim; i += 2)
+                    for (int i = 0; i < rotaryDim; i += 2)
                     {
                         float theta = position * MathF.Exp(i * dimInv * negLogBase);
                         float cosTheta = MathF.Cos(theta);

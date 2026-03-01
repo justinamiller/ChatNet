@@ -76,7 +76,7 @@ namespace ChatNet.Core.Models
                     GemmaModel.DebugEnabled = debugEnabled;
                     var gemmaCfg = new GemmaConfig(config);
                     var weights = new GemmaWeights(weightLoader, gemmaCfg);
-                    return new GemmaModel(config, weights);
+                    return new GemmaModel(config, gemmaCfg, weights);
                 }
 
                 case ModelType.Phi:

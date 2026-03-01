@@ -44,10 +44,10 @@ namespace ChatNet.Core.Models.Gemma
         public ModelConfig Config => _modelConfig;
         public static bool DebugEnabled { get; set; }
 
-        public GemmaModel(ModelConfig modelConfig, GemmaWeights weights)
+        public GemmaModel(ModelConfig modelConfig, GemmaConfig gemmaCfg, GemmaWeights weights)
         {
             _modelConfig = modelConfig;
-            _cfg = new GemmaConfig(modelConfig);
+            _cfg = gemmaCfg;
             _weights = weights;
 
             int maxSeq = _cfg.ContextLength;

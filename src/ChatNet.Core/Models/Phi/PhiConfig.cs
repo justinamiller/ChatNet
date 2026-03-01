@@ -20,6 +20,7 @@ namespace ChatNet.Core.Models.Phi
         public float RopeFreqBase { get; }
         public float RmsNormEps { get; }
         public int KvMul { get; }
+        public int RotaryDim { get; }
 
         public PhiConfig(ModelConfig config)
         {
@@ -35,6 +36,7 @@ namespace ChatNet.Core.Models.Phi
             RopeFreqBase = config.RopeFreqBase;
             RmsNormEps = config.RmsNormEpsilon;
             KvMul = HeadCount / KvHeadCount;
+            RotaryDim = config.RotaryDim;
         }
     }
 }

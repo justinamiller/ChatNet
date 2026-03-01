@@ -91,6 +91,7 @@ namespace ChatNet.Core
                     " ctx=" + config.ContextLength +
                     " vocab=" + config.VocabSize);
                 Console.Error.WriteLine("[DEBUG] RoPE freq_base=" + config.RopeFreqBase +
+                    " rotary_dim=" + config.RotaryDim +
                     " rms_norm_eps=" + config.RmsNormEpsilon +
                     " bos=" + config.BosTokenId + " eos=" + config.EosTokenId);
                 if (config.AttnLogitSoftcap > 0f || config.FinalLogitSoftcap > 0f)

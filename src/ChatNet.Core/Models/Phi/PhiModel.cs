@@ -122,7 +122,7 @@ namespace ChatNet.Core.Models.Phi
                     }
 
                     TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
-                        pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase);
+                        pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase, _cfg.RotaryDim);
 
                     int kvCacheLayerOffset = l * _cfg.ContextLength * kvDim;
                     int kvCachePos = kvCacheLayerOffset + pos * kvDim;
