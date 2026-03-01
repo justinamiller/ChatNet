@@ -286,6 +286,114 @@ namespace ChatNet.Core.Tensors
         }
 
         /// <summary>
+        /// GELU activation with element-wise multiply: gate[i] = gelu(gate[i]) * up[i]
+        /// where gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        /// Used by Gemma architecture.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public static unsafe void GeluElementwiseMul(Span<float> gate, ReadOnlySpan<float> up, int length)
+        {
+            const float Sqrt2OverPi = 0.7978845608028654f;
+            const float Coeff = 0.044715f;
+
+            fixed (float* pGate = gate)
+            fixed (float* pUp = up)
+            {
+                int i = 0;
+                int limit4 = length - 3;
+                for (; i < limit4; i += 4)
+                {
+                    float x0 = pGate[i];
+                    float x1 = pGate[i + 1];
+                    float x2 = pGate[i + 2];
+                    float x3 = pGate[i + 3];
+
+                    float g0 = 0.5f * x0 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x0 + Coeff * x0 * x0 * x0)));
+                    float g1 = 0.5f * x1 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x1 + Coeff * x1 * x1 * x1)));
+                    float g2 = 0.5f * x2 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x2 + Coeff * x2 * x2 * x2)));
+                    float g3 = 0.5f * x3 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x3 + Coeff * x3 * x3 * x3)));
+
+                    pGate[i] = g0 * pUp[i];
+                    pGate[i + 1] = g1 * pUp[i + 1];
+                    pGate[i + 2] = g2 * pUp[i + 2];
+                    pGate[i + 3] = g3 * pUp[i + 3];
+                }
+
+                for (; i < length; i++)
+                {
+                    float x = pGate[i];
+                    pGate[i] = (0.5f * x * (1.0f + MathF.Tanh(Sqrt2OverPi * (x + Coeff * x * x * x)))) * pUp[i];
+                }
+            }
+        }
+
+        /// <summary>
+        /// RMS Norm with weight offset: output[i] = input[i] * (weight[i] + 1.0) / sqrt(mean(input^2) + eps)
+        /// Used by Gemma architecture where norm weights are stored as delta from 1.0.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public static unsafe void RmsNormWithOffset(ReadOnlySpan<float> input, ReadOnlySpan<float> weight,
+            Span<float> output, float epsilon)
+        {
+            int n = input.Length;
+
+            fixed (float* pInput = input)
+            fixed (float* pWeight = weight)
+            fixed (float* pOutput = output)
+            {
+                float sumSq = 0f;
+                int i = 0;
+
+                if (Vector.IsHardwareAccelerated && n >= Vector<float>.Count)
+                {
+                    int vecLen = Vector<float>.Count;
+                    var vAcc0 = Vector<float>.Zero;
+                    var vAcc1 = Vector<float>.Zero;
+                    int limit2 = n - 2 * vecLen + 1;
+                    for (; i < limit2; i += 2 * vecLen)
+                    {
+                        var v0 = *(Vector<float>*)(pInput + i);
+                        var v1 = *(Vector<float>*)(pInput + i + vecLen);
+                        vAcc0 += v0 * v0;
+                        vAcc1 += v1 * v1;
+                    }
+                    int limit1 = n - vecLen + 1;
+                    for (; i < limit1; i += vecLen)
+                    {
+                        var v = *(Vector<float>*)(pInput + i);
+                        vAcc0 += v * v;
+                    }
+                    sumSq = VectorSum(vAcc0 + vAcc1);
+                }
+                for (; i < n; i++)
+                {
+                    sumSq += pInput[i] * pInput[i];
+                }
+
+                float rms = 1.0f / MathF.Sqrt(sumSq / n + epsilon);
+
+                i = 0;
+                if (Vector.IsHardwareAccelerated && n >= Vector<float>.Count)
+                {
+                    var vRms = new Vector<float>(rms);
+                    var vOne = Vector<float>.One;
+                    int vecLen = Vector<float>.Count;
+                    int limit = n - vecLen + 1;
+                    for (; i < limit; i += vecLen)
+                    {
+                        var vIn = *(Vector<float>*)(pInput + i);
+                        var vW = *(Vector<float>*)(pWeight + i) + vOne;
+                        *(Vector<float>*)(pOutput + i) = vIn * vRms * vW;
+                    }
+                }
+                for (; i < n; i++)
+                {
+                    pOutput[i] = pInput[i] * rms * (pWeight[i] + 1.0f);
+                }
+            }
+        }
+
+        /// <summary>
         /// Apply RoPE (Rotary Position Embeddings) to query and key vectors.
         ///
         /// Optimizations vs original:

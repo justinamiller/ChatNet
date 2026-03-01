@@ -81,18 +81,34 @@ namespace ChatNet.Core.Gguf
         {
             string arch = Metadata.GetString("general.architecture", "llama");
 
+            // Helper to read int with architecture-specific key and fallback aliases
+            int GetArchInt(string suffix, int defaultValue)
+            {
+                int val = Metadata.GetInt32(arch + "." + suffix, -1);
+                if (val >= 0) return val;
+                // Try common aliases
+                return Metadata.GetInt32(suffix, defaultValue);
+            }
+
+            float GetArchFloat(string suffix, float defaultValue)
+            {
+                float val = Metadata.GetFloat32(arch + "." + suffix, float.NaN);
+                if (!float.IsNaN(val)) return val;
+                return Metadata.GetFloat32(suffix, defaultValue);
+            }
+
             var config = new ModelConfig
             {
                 Architecture = arch,
                 ModelName = Metadata.GetString("general.name", "Unknown"),
-                EmbeddingDim = Metadata.GetInt32($"{arch}.embedding_length", 2048),
-                LayerCount = Metadata.GetInt32($"{arch}.block_count", 22),
-                AttentionHeadCount = Metadata.GetInt32($"{arch}.attention.head_count", 32),
-                KeyValueHeadCount = Metadata.GetInt32($"{arch}.attention.head_count_kv", 4),
-                FeedForwardDim = Metadata.GetInt32($"{arch}.feed_forward_length", 5632),
-                ContextLength = Metadata.GetInt32($"{arch}.context_length", 2048),
-                RopeFreqBase = Metadata.GetFloat32($"{arch}.rope.freq_base", 10000.0f),
-                RmsNormEpsilon = Metadata.GetFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-5f),
+                EmbeddingDim = GetArchInt("embedding_length", 2048),
+                LayerCount = GetArchInt("block_count", 22),
+                AttentionHeadCount = GetArchInt("attention.head_count", 32),
+                KeyValueHeadCount = GetArchInt("attention.head_count_kv", 4),
+                FeedForwardDim = GetArchInt("feed_forward_length", 5632),
+                ContextLength = GetArchInt("context_length", 2048),
+                RopeFreqBase = GetArchFloat("rope.freq_base", 10000.0f),
+                RmsNormEpsilon = GetArchFloat("attention.layer_norm_rms_epsilon", 1e-5f),
                 BosTokenId = Metadata.GetInt32("tokenizer.ggml.bos_token_id", 1),
                 EosTokenId = Metadata.GetInt32("tokenizer.ggml.eos_token_id", 2),
             };
@@ -107,7 +123,7 @@ namespace ChatNet.Core.Gguf
             }
             else
             {
-                config.VocabSize = Metadata.GetInt32($"{arch}.vocab_size", 32000);
+                config.VocabSize = GetArchInt("vocab_size", 32000);
             }
 
             return config;
