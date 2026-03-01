@@ -27,6 +27,43 @@ namespace ChatNet.Core.Tensors
         /// </summary>
         private const int ParallelRowThreshold = 512;
 
+        // Reusable state objects to avoid closure + delegate allocations in Parallel.For.
+        // Safe because the forward pass is single-threaded (only the inner row loop is parallel).
+        private static readonly MatVecQ4State s_q4State = new();
+        private static readonly Action<int> s_q4Body = s_q4State.Execute;
+        private static readonly MatVecQ6KState s_q6kState = new();
+        private static readonly Action<int> s_q6kBody = s_q6kState.Execute;
+
+        private sealed unsafe class MatVecQ4State
+        {
+            public byte* W;
+            public float* PIn;
+            public float* POut;
+            public int Bpr;
+            public int Dim;
+
+            public void Execute(int row)
+            {
+                byte* rowPtr = W + (long)row * Bpr;
+                POut[row] = DequantQ4_0.DotProduct(rowPtr, PIn, Dim);
+            }
+        }
+
+        private sealed unsafe class MatVecQ6KState
+        {
+            public byte* W;
+            public float* PIn;
+            public float* POut;
+            public int Bpr;
+            public int Dim;
+
+            public void Execute(int row)
+            {
+                byte* rowPtr = W + (long)row * Bpr;
+                POut[row] = DequantQ6K.DotProduct(rowPtr, PIn, Dim);
+            }
+        }
+
         /// <summary>
         /// RMS Norm: output[i] = input[i] * weight[i] / sqrt(mean(input^2) + eps)
         ///
@@ -329,13 +366,12 @@ namespace ChatNet.Core.Tensors
 
                 if (outDim >= ParallelRowThreshold)
                 {
-                    int bpr = bytesPerRow;
-                    int dim = inDim;
-                    Parallel.For(0, outDim, row =>
-                    {
-                        byte* rowPtr = w + (long)row * bpr;
-                        pOut[row] = DequantQ4_0.DotProduct(rowPtr, pIn, dim);
-                    });
+                    s_q4State.W = w;
+                    s_q4State.PIn = pIn;
+                    s_q4State.POut = pOut;
+                    s_q4State.Bpr = bytesPerRow;
+                    s_q4State.Dim = inDim;
+                    Parallel.For(0, outDim, s_q4Body);
                 }
                 else
                 {
@@ -368,13 +404,12 @@ namespace ChatNet.Core.Tensors
 
                 if (outDim >= ParallelRowThreshold)
                 {
-                    int bpr = bytesPerRow;
-                    int dim = inDim;
-                    Parallel.For(0, outDim, row =>
-                    {
-                        byte* rowPtr = w + (long)row * bpr;
-                        pOut[row] = DequantQ6K.DotProduct(rowPtr, pIn, dim);
-                    });
+                    s_q6kState.W = w;
+                    s_q6kState.PIn = pIn;
+                    s_q6kState.POut = pOut;
+                    s_q6kState.Bpr = bytesPerRow;
+                    s_q6kState.Dim = inDim;
+                    Parallel.For(0, outDim, s_q6kBody);
                 }
                 else
                 {
