@@ -109,14 +109,19 @@ namespace ChatNet.Core.Gguf
                 return defaultValue;
             }
 
+            int nHeads = GetArchInt("attention.head_count", 32);
+            // Default KV heads to n_heads (full MHA) if not specified.
+            // GQA models always store head_count_kv explicitly; omission implies MHA.
+            int nKvHeads = GetArchInt("attention.head_count_kv", nHeads);
+
             var config = new ModelConfig
             {
                 Architecture = arch,
                 ModelName = Metadata.GetString("general.name", "Unknown"),
                 EmbeddingDim = GetArchInt("embedding_length", 2048),
                 LayerCount = GetArchInt("block_count", 22),
-                AttentionHeadCount = GetArchInt("attention.head_count", 32),
-                KeyValueHeadCount = GetArchInt("attention.head_count_kv", 4),
+                AttentionHeadCount = nHeads,
+                KeyValueHeadCount = nKvHeads,
                 FeedForwardDim = GetArchInt("feed_forward_length", 5632),
                 ContextLength = GetArchInt("context_length", 2048),
                 RopeFreqBase = GetArchFloat("rope.freq_base", 10000.0f),
@@ -128,7 +133,11 @@ namespace ChatNet.Core.Gguf
                 FinalLogitSoftcap = GetArchFloat("final_logit_softcapping", 0f),
             };
 
-            config.HeadDim = config.EmbeddingDim / config.AttentionHeadCount;
+            // HeadDim: prefer explicit GGUF key (Gemma 2 has head_dim != dim/n_heads)
+            int explicitHeadDim = GetArchInt("attention.key_length", -1);
+            config.HeadDim = explicitHeadDim > 0
+                ? explicitHeadDim
+                : config.EmbeddingDim / config.AttentionHeadCount;
 
             // Vocab size from token array length if available, else from metadata
             string[]? tokens = Metadata.GetStringArray("tokenizer.ggml.tokens");

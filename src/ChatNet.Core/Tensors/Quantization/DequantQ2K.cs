@@ -48,24 +48,37 @@ namespace ChatNet.Core.Tensors.Quantization
                 int scBase = srcOffset + ScalesOffset;
                 int qsBase = srcOffset + QsOffset;
 
-                for (int i = 0; i < 16; i++)
-                {
-                    int sc = quantizedData[scBase + i] & 0x0F;
-                    int m = (quantizedData[scBase + i] >> 4) & 0x0F;
-                    float dsc = d * sc;
-                    float dm = dmin * m;
+                // Q2_K layout: 2 groups of 128 elements, each group uses 32 qs bytes.
+                // Within each group, 4 bit-shift iterations extract 2-bit values at shifts 0,2,4,6.
+                // Each shift iteration produces 32 elements (2 sub-blocks of 16).
+                // Scales are consumed 2 per shift iteration (16 total).
+                int outIdx = dstOffset;
+                int scaleIdx = 0;
+                int qsGroupBase = qsBase;
 
-                    // Each sub-block has 16 elements, packed 4 per byte => 4 bytes per sub-block
-                    int qsByteBase = qsBase + i * 4;
-                    for (int j = 0; j < 4; j++)
+                for (int group = 0; group < 2; group++)
+                {
+                    for (int shift = 0; shift < 8; shift += 2)
                     {
-                        byte qsByte = quantizedData[qsByteBase + j];
-                        int outIdx = dstOffset + i * 16 + j * 4;
-                        output[outIdx + 0] = dsc * ((qsByte >> 0) & 3) - dm;
-                        output[outIdx + 1] = dsc * ((qsByte >> 2) & 3) - dm;
-                        output[outIdx + 2] = dsc * ((qsByte >> 4) & 3) - dm;
-                        output[outIdx + 3] = dsc * ((qsByte >> 6) & 3) - dm;
+                        // First half: bytes [0..15] of this group, 16 elements
+                        float dl = d * (quantizedData[scBase + scaleIdx] & 0x0F);
+                        float ml = dmin * ((quantizedData[scBase + scaleIdx] >> 4) & 0x0F);
+                        for (int l = 0; l < 16; l++)
+                        {
+                            output[outIdx++] = dl * ((quantizedData[qsGroupBase + l] >> shift) & 3) - ml;
+                        }
+
+                        // Second half: bytes [16..31] of this group, 16 elements
+                        dl = d * (quantizedData[scBase + scaleIdx + 1] & 0x0F);
+                        ml = dmin * ((quantizedData[scBase + scaleIdx + 1] >> 4) & 0x0F);
+                        for (int l = 0; l < 16; l++)
+                        {
+                            output[outIdx++] = dl * ((quantizedData[qsGroupBase + 16 + l] >> shift) & 3) - ml;
+                        }
+
+                        scaleIdx += 2;
                     }
+                    qsGroupBase += 32;
                 }
 
                 srcOffset += BytesPerBlock;
@@ -100,25 +113,39 @@ namespace ChatNet.Core.Tensors.Quantization
                 int qsBase = srcOffset + QsOffset;
 
                 float blockSum = 0f;
+                int yIdx = inputIdx;
+                int scaleIdx = 0;
+                int qsGroupBase = qsBase;
 
-                for (int i = 0; i < 16; i++)
+                for (int group = 0; group < 2; group++)
                 {
-                    int sc = data[scBase + i] & 0x0F;
-                    int m = (data[scBase + i] >> 4) & 0x0F;
-                    float dsc = d * sc;
-                    float dm = dmin * m;
-
-                    int qsByteBase = qsBase + i * 4;
-                    int inBase = inputIdx + i * 16;
-                    for (int j = 0; j < 4; j++)
+                    for (int shift = 0; shift < 8; shift += 2)
                     {
-                        byte qsByte = data[qsByteBase + j];
-                        int inIdx = inBase + j * 4;
-                        blockSum += (dsc * ((qsByte >> 0) & 3) - dm) * input[inIdx + 0];
-                        blockSum += (dsc * ((qsByte >> 2) & 3) - dm) * input[inIdx + 1];
-                        blockSum += (dsc * ((qsByte >> 4) & 3) - dm) * input[inIdx + 2];
-                        blockSum += (dsc * ((qsByte >> 6) & 3) - dm) * input[inIdx + 3];
+                        int sc0 = data[scBase + scaleIdx] & 0x0F;
+                        int m0 = (data[scBase + scaleIdx] >> 4) & 0x0F;
+                        float dl0 = d * sc0;
+                        float ml0 = dmin * m0;
+
+                        for (int l = 0; l < 16; l++)
+                        {
+                            int q = (data[qsGroupBase + l] >> shift) & 3;
+                            blockSum += (dl0 * q - ml0) * input[yIdx++];
+                        }
+
+                        int sc1 = data[scBase + scaleIdx + 1] & 0x0F;
+                        int m1 = (data[scBase + scaleIdx + 1] >> 4) & 0x0F;
+                        float dl1 = d * sc1;
+                        float ml1 = dmin * m1;
+
+                        for (int l = 0; l < 16; l++)
+                        {
+                            int q = (data[qsGroupBase + 16 + l] >> shift) & 3;
+                            blockSum += (dl1 * q - ml1) * input[yIdx++];
+                        }
+
+                        scaleIdx += 2;
                     }
+                    qsGroupBase += 32;
                 }
 
                 sum += blockSum;

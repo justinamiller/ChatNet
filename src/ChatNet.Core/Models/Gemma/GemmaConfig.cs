@@ -24,6 +24,9 @@ namespace ChatNet.Core.Models.Gemma
         public int KvMul { get; }
         public float EmbeddingScale { get; }
 
+        /// <summary>Total Q dimension = HeadCount * HeadDim (may differ from Dim for Gemma 2).</summary>
+        public int QDim { get; }
+
         // Gemma 2 soft-capping (0 = disabled)
         public float AttnLogitSoftcap { get; }
         public float FinalLogitSoftcap { get; }
@@ -40,6 +43,7 @@ namespace ChatNet.Core.Models.Gemma
             KvHeadCount = config.KeyValueHeadCount;
             HeadDim = config.HeadDim;
             KvDim = KvHeadCount * HeadDim;
+            QDim = HeadCount * HeadDim;
             VocabSize = config.VocabSize;
             ContextLength = config.ContextLength;
             RopeFreqBase = config.RopeFreqBase;

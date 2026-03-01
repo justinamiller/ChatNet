@@ -35,6 +35,9 @@ namespace ChatNet.Core.Tokenizer
         private readonly int _spSpaceTokenId;                      // SentencePiece ▁ (U+2581) token ID
         private readonly Dictionary<char, int> _unicodeCharTokenIds; // non-ASCII single-char tokens
 
+        // Tokenizer model type: false = SentencePiece (Llama/Gemma), true = GPT-2 BPE (Qwen)
+        private readonly bool _isGpt2;
+
         // Static cache for single-char strings (used only during construction)
         private static readonly string[] s_charStrings = BuildCharStringCache();
 
@@ -76,6 +79,11 @@ namespace ChatNet.Core.Tokenizer
             _vocab = new TokenVocab(tokens, scores, tokenTypes);
             _bosToken = metadata.GetInt32("tokenizer.ggml.bos_token_id", 1);
             _eosToken = metadata.GetInt32("tokenizer.ggml.eos_token_id", 2);
+
+            // Detect tokenizer model: "gpt2" = GPT-2 BPE (Qwen), "llama" = SentencePiece
+            string tokenizerModel = metadata.GetString("tokenizer.ggml.model", "llama");
+            _isGpt2 = tokenizerModel == "gpt2";
+
             // Some models (e.g., Qwen) set add_bos_token=false - respect this flag.
             // The value may be stored as bool, byte, or int in different GGUF producers.
             if (metadata.TryGet<bool>("tokenizer.ggml.add_bos_token", out bool addBos))
@@ -83,7 +91,7 @@ namespace ChatNet.Core.Tokenizer
             else if (metadata.TryGet<byte>("tokenizer.ggml.add_bos_token", out byte addBosByte))
                 _addBosToken = addBosByte != 0;
             else
-                _addBosToken = true; // default: prepend BOS (Llama behavior)
+                _addBosToken = !_isGpt2; // default: SentencePiece adds BOS, GPT-2 does not
 
             // Build byte fallback mapping
             _byteTokens = new int[256];
@@ -179,7 +187,9 @@ namespace ChatNet.Core.Tokenizer
                 }
             }
 
-            // Replace SentencePiece ▁ with space
+            // SentencePiece: replace ▁ with space; GPT-2: use token as-is
+            if (_isGpt2)
+                return token;
             return token.Replace("\u2581", " ");
         }
 
@@ -286,7 +296,8 @@ namespace ChatNet.Core.Tokenizer
         /// <summary>
         /// BPE encode a text segment (no special tokens).
         /// Uses int token IDs with linked-list structure and pooled buffers (refactor items 1, 3, 6).
-        /// Applies SentencePiece ▁ prefix and space replacement, then iterative BPE merging.
+        /// For SentencePiece: applies ▁ prefix and space replacement.
+        /// For GPT-2 BPE: uses text directly without ▁ processing.
         /// </summary>
         private int EncodeBpeSegment(ReadOnlySpan<char> text, Span<int> outputTokens, int pos)
         {
@@ -300,13 +311,26 @@ namespace ChatNet.Core.Tokenizer
             int[] symPrev = ArrayPool<int>.Shared.Rent(maxSymbols);
             int[] symNext = ArrayPool<int>.Shared.Rent(maxSymbols);
 
-            // Build processed char buffer: ▁ prefix + text with spaces replaced by ▁
-            // Encode entire buffer to UTF-8 once for byte fallback (refactor item 6)
-            int processedCharLen = 1 + text.Length;
-            char[] procChars = ArrayPool<char>.Shared.Rent(processedCharLen);
-            procChars[0] = '\u2581';
-            for (int i = 0; i < text.Length; i++)
-                procChars[i + 1] = text[i] == ' ' ? '\u2581' : text[i];
+            // Build processed char buffer:
+            // SentencePiece: ▁ prefix + text with spaces replaced by ▁
+            // GPT-2 BPE: text as-is (no ▁ prefix, no space replacement)
+            int processedCharLen;
+            char[] procChars;
+            if (_isGpt2)
+            {
+                processedCharLen = text.Length;
+                procChars = ArrayPool<char>.Shared.Rent(processedCharLen);
+                for (int i = 0; i < text.Length; i++)
+                    procChars[i] = text[i];
+            }
+            else
+            {
+                processedCharLen = 1 + text.Length;
+                procChars = ArrayPool<char>.Shared.Rent(processedCharLen);
+                procChars[0] = '\u2581';
+                for (int i = 0; i < text.Length; i++)
+                    procChars[i + 1] = text[i] == ' ' ? '\u2581' : text[i];
+            }
 
             int utf8Len = Encoding.UTF8.GetByteCount(procChars, 0, processedCharLen);
             byte[] utf8Buf = ArrayPool<byte>.Shared.Rent(utf8Len);

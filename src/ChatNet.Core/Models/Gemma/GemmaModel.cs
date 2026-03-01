@@ -58,12 +58,14 @@ namespace ChatNet.Core.Models.Gemma
             _keyCache = new float[_cfg.LayerCount * maxSeq * kvDim];
             _valueCache = new float[_cfg.LayerCount * maxSeq * kvDim];
 
+            int qDim = _cfg.QDim; // nHeads * headDim (may differ from dim for Gemma 2)
+
             _x = new float[dim];
             _xNorm = new float[dim];
-            _q = new float[dim];
+            _q = new float[qDim];
             _k = new float[kvDim];
             _v = new float[kvDim];
-            _attnOut = new float[dim];
+            _attnOut = new float[qDim];
             _gate = new float[hiddenDim];
             _up = new float[hiddenDim];
             _ffnOut = new float[dim];
@@ -73,6 +75,7 @@ namespace ChatNet.Core.Models.Gemma
         public void Forward(ReadOnlySpan<int> tokenIds, int position, Span<float> logits)
         {
             int dim = _cfg.Dim;
+            int qDim = _cfg.QDim; // nHeads * headDim (may differ from dim)
             int kvDim = _cfg.KvDim;
             int headDim = _cfg.HeadDim;
             int nHeads = _cfg.HeadCount;
@@ -103,15 +106,16 @@ namespace ChatNet.Core.Models.Gemma
 
                     unsafe
                     {
+                        // Q: [dim, qDim], K: [dim, kvDim], V: [dim, kvDim]
                         MatVecMulByType(_weights.GetAttnQWeight(l), _weights.AttnQType[l],
-                            _xNorm.AsSpan(0, dim), _q.AsSpan(0, dim), dim, dim);
+                            _xNorm.AsSpan(0, dim), _q.AsSpan(0, qDim), qDim, dim);
                         MatVecMulByType(_weights.GetAttnKWeight(l), _weights.AttnKType[l],
                             _xNorm.AsSpan(0, dim), _k.AsSpan(0, kvDim), kvDim, dim);
                         MatVecMulByType(_weights.GetAttnVWeight(l), _weights.AttnVType[l],
                             _xNorm.AsSpan(0, dim), _v.AsSpan(0, kvDim), kvDim, dim);
                     }
 
-                    TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
+                    TensorMath.ApplyRoPE(_q.AsSpan(0, qDim), _k.AsSpan(0, kvDim),
                         pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase);
 
                     int kvCacheLayerOffset = l * _cfg.ContextLength * kvDim;
@@ -119,12 +123,13 @@ namespace ChatNet.Core.Models.Gemma
                     Array.Copy(_k, 0, _keyCache, kvCachePos, kvDim);
                     Array.Copy(_v, 0, _valueCache, kvCachePos, kvDim);
 
-                    ComputeAttention(l, pos, headDim, nHeads, nKvHeads, kvMul, kvDim, dim, attnSoftcap);
+                    ComputeAttention(l, pos, headDim, nHeads, nKvHeads, kvMul, kvDim, qDim, attnSoftcap);
 
                     unsafe
                     {
+                        // Attn output: [qDim, dim]
                         MatVecMulByType(_weights.GetAttnOutputWeight(l), _weights.AttnOutputType[l],
-                            _attnOut.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim, dim);
+                            _attnOut.AsSpan(0, qDim), _ffnOut.AsSpan(0, dim), dim, qDim);
                     }
 
                     // Gemma 2: post-attention norm
@@ -219,7 +224,7 @@ namespace ChatNet.Core.Models.Gemma
         }
 
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private unsafe void ComputeAttention(int layer, int pos, int headDim, int nHeads, int nKvHeads, int kvMul, int kvDim, int dim, float softcap)
+        private unsafe void ComputeAttention(int layer, int pos, int headDim, int nHeads, int nKvHeads, int kvMul, int kvDim, int qDim, float softcap)
         {
             int maxSeq = _cfg.ContextLength;
             int kvCacheLayerOffset = layer * maxSeq * kvDim;
@@ -234,7 +239,7 @@ namespace ChatNet.Core.Models.Gemma
             fixed (float* pAttnScores = _attnScores)
             fixed (float* pAttnOut = _attnOut)
             {
-                new Span<float>(pAttnOut, dim).Clear();
+                new Span<float>(pAttnOut, qDim).Clear();
 
                 for (int h = 0; h < nHeads; h++)
                 {
