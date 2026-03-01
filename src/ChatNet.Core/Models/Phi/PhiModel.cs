@@ -28,6 +28,7 @@ namespace ChatNet.Core.Models.Phi
         private readonly float[] _q;
         private readonly float[] _k;
         private readonly float[] _v;
+        private readonly float[] _qkv; // For fused QKV projections
         private readonly float[] _attnOut;
         private readonly float[] _gate;
         private readonly float[] _up;
@@ -57,6 +58,8 @@ namespace ChatNet.Core.Models.Phi
             _q = new float[dim];
             _k = new float[kvDim];
             _v = new float[kvDim];
+            // Fused QKV: output is [dim + kvDim + kvDim] = Q concat K concat V
+            _qkv = _weights.HasFusedQkv ? new float[dim + kvDim + kvDim] : Array.Empty<float>();
             _attnOut = new float[dim];
             _gate = new float[hiddenDim];
             _up = new float[hiddenDim];
@@ -76,7 +79,9 @@ namespace ChatNet.Core.Models.Phi
             int layers = _cfg.LayerCount;
             int hiddenDim = _cfg.HiddenDim;
             int vocabSize = _cfg.VocabSize;
+            bool hasFusedQkv = _weights.HasFusedQkv;
             bool hasFusedGateUp = _weights.HasFusedGateUp;
+            int qkvDim = dim + kvDim + kvDim; // Total fused QKV output size
 
             for (int t = 0; t < tokenIds.Length; t++)
             {
@@ -90,14 +95,30 @@ namespace ChatNet.Core.Models.Phi
                     ReadOnlySpan<float> attnNormW = GetF32Weights(_weights.GetAttnNormWeight(l), dim);
                     TensorMath.RmsNorm(_x.AsSpan(0, dim), attnNormW, _xNorm.AsSpan(0, dim), _cfg.RmsNormEps);
 
-                    unsafe
+                    if (hasFusedQkv)
                     {
-                        MatVecMulByType(_weights.GetAttnQWeight(l), _weights.AttnQType[l],
-                            _xNorm.AsSpan(0, dim), _q.AsSpan(0, dim), dim, dim);
-                        MatVecMulByType(_weights.GetAttnKWeight(l), _weights.AttnKType[l],
-                            _xNorm.AsSpan(0, dim), _k.AsSpan(0, kvDim), kvDim, dim);
-                        MatVecMulByType(_weights.GetAttnVWeight(l), _weights.AttnVType[l],
-                            _xNorm.AsSpan(0, dim), _v.AsSpan(0, kvDim), kvDim, dim);
+                        // Phi-3 fused QKV: single matmul, then split into Q, K, V
+                        unsafe
+                        {
+                            MatVecMulByType(_weights.GetAttnQkvWeight(l), _weights.AttnQkvType[l],
+                                _xNorm.AsSpan(0, dim), _qkv.AsSpan(0, qkvDim), qkvDim, dim);
+                        }
+                        // Split: [0..dim) = Q, [dim..dim+kvDim) = K, [dim+kvDim..dim+2*kvDim) = V
+                        _qkv.AsSpan(0, dim).CopyTo(_q.AsSpan(0, dim));
+                        _qkv.AsSpan(dim, kvDim).CopyTo(_k.AsSpan(0, kvDim));
+                        _qkv.AsSpan(dim + kvDim, kvDim).CopyTo(_v.AsSpan(0, kvDim));
+                    }
+                    else
+                    {
+                        unsafe
+                        {
+                            MatVecMulByType(_weights.GetAttnQWeight(l), _weights.AttnQType[l],
+                                _xNorm.AsSpan(0, dim), _q.AsSpan(0, dim), dim, dim);
+                            MatVecMulByType(_weights.GetAttnKWeight(l), _weights.AttnKType[l],
+                                _xNorm.AsSpan(0, dim), _k.AsSpan(0, kvDim), kvDim, dim);
+                            MatVecMulByType(_weights.GetAttnVWeight(l), _weights.AttnVType[l],
+                                _xNorm.AsSpan(0, dim), _v.AsSpan(0, kvDim), kvDim, dim);
+                        }
                     }
 
                     TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),

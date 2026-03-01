@@ -19,5 +19,9 @@ namespace ChatNet.Core.Abstractions
         public float RmsNormEpsilon { get; set; } = 1e-5f;
         public int BosTokenId { get; set; } = 1;
         public int EosTokenId { get; set; } = 2;
+
+        // Gemma 2 soft-capping parameters (0 = disabled)
+        public float AttnLogitSoftcap { get; set; }
+        public float FinalLogitSoftcap { get; set; }
     }
 }

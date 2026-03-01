@@ -82,6 +82,20 @@ namespace ChatNet.Core
             {
                 Console.Error.WriteLine("[DEBUG] Detected architecture: " + modelType +
                     " (from '" + config.Architecture + "')");
+                Console.Error.WriteLine("[DEBUG] Config: dim=" + config.EmbeddingDim +
+                    " layers=" + config.LayerCount +
+                    " heads=" + config.AttentionHeadCount +
+                    " kv_heads=" + config.KeyValueHeadCount +
+                    " headDim=" + config.HeadDim +
+                    " ffn=" + config.FeedForwardDim +
+                    " ctx=" + config.ContextLength +
+                    " vocab=" + config.VocabSize);
+                Console.Error.WriteLine("[DEBUG] RoPE freq_base=" + config.RopeFreqBase +
+                    " rms_norm_eps=" + config.RmsNormEpsilon +
+                    " bos=" + config.BosTokenId + " eos=" + config.EosTokenId);
+                if (config.AttnLogitSoftcap > 0f || config.FinalLogitSoftcap > 0f)
+                    Console.Error.WriteLine("[DEBUG] Softcap: attn=" + config.AttnLogitSoftcap +
+                        " final=" + config.FinalLogitSoftcap);
             }
 
             // Step 3: Create memory-mapped weight access
@@ -137,27 +151,41 @@ namespace ChatNet.Core
                 mapped++;
 
             // Check per-layer tensors
-            string[] perLayerSuffixes = new[]
+            string[] perLayerRequired = new[]
             {
-                ".attn_norm.weight", ".attn_q.weight", ".attn_k.weight",
-                ".attn_v.weight", ".attn_output.weight",
-                ".ffn_norm.weight", ".ffn_up.weight", ".ffn_down.weight"
+                ".attn_norm.weight", ".attn_output.weight",
+                ".ffn_norm.weight", ".ffn_down.weight"
             };
 
             for (int l = 0; l < config.LayerCount; l++)
             {
                 string prefix = "blk." + l.ToString();
-                for (int s = 0; s < perLayerSuffixes.Length; s++)
+                for (int s = 0; s < perLayerRequired.Length; s++)
                 {
-                    if (tensorNames.Contains(prefix + perLayerSuffixes[s]))
+                    if (tensorNames.Contains(prefix + perLayerRequired[s]))
                         mapped++;
                     else
                         missing++;
                 }
 
-                // ffn_gate is optional (not all architectures have it)
-                if (tensorNames.Contains(prefix + ".ffn_gate.weight"))
+                // Q/K/V can be separate or fused (attn_qkv.weight)
+                if (tensorNames.Contains(prefix + ".attn_qkv.weight"))
                     mapped++;
+                else
+                {
+                    if (tensorNames.Contains(prefix + ".attn_q.weight")) mapped++;
+                    if (tensorNames.Contains(prefix + ".attn_k.weight")) mapped++;
+                    if (tensorNames.Contains(prefix + ".attn_v.weight")) mapped++;
+                }
+
+                // FFN gate/up can be separate or fused
+                if (tensorNames.Contains(prefix + ".ffn_gate_up.weight"))
+                    mapped++;
+                else
+                {
+                    if (tensorNames.Contains(prefix + ".ffn_gate.weight")) mapped++;
+                    if (tensorNames.Contains(prefix + ".ffn_up.weight")) mapped++;
+                }
             }
 
             Console.Error.WriteLine("[DEBUG] Tensor mapping for " + modelType + ": " +

@@ -437,6 +437,51 @@ namespace ChatNet.Tests
 
         #endregion
 
+        #region ModelConfig Tests
+
+        [TestMethod]
+        public void ModelConfig_SoftcapDefaults_AreZero()
+        {
+            var config = new ModelConfig();
+            Assert.AreEqual(0f, config.AttnLogitSoftcap);
+            Assert.AreEqual(0f, config.FinalLogitSoftcap);
+        }
+
+        [TestMethod]
+        public void ModelConfig_RopeFreqBaseDefault_Is10000()
+        {
+            var config = new ModelConfig();
+            Assert.AreEqual(10000.0f, config.RopeFreqBase);
+        }
+
+        #endregion
+
+        #region GgufMetadata Float Conversion Tests
+
+        [TestMethod]
+        public void GgufMetadata_GetFloat32_HandlesIntTypes()
+        {
+            var meta = new ChatNet.Core.Gguf.GgufMetadata();
+            meta.Set("test_uint", (uint)1000000);
+            meta.Set("test_int", (int)500000);
+
+            Assert.AreEqual(1000000f, meta.GetFloat32("test_uint"), 1f);
+            Assert.AreEqual(500000f, meta.GetFloat32("test_int"), 1f);
+        }
+
+        [TestMethod]
+        public void GgufMetadata_GetFloat32_HandlesFloatAndDouble()
+        {
+            var meta = new ChatNet.Core.Gguf.GgufMetadata();
+            meta.Set("test_float", 1000000.0f);
+            meta.Set("test_double", 1000000.0);
+
+            Assert.AreEqual(1000000f, meta.GetFloat32("test_float"), 1f);
+            Assert.AreEqual(1000000f, meta.GetFloat32("test_double"), 1f);
+        }
+
+        #endregion
+
         #region Chat Template Multi-Turn Tests
 
         [TestMethod]

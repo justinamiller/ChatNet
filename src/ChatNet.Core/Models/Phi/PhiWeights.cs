@@ -8,7 +8,7 @@ namespace ChatNet.Core.Models.Phi
 {
     /// <summary>
     /// Weight tensor storage for Phi model.
-    /// Supports both split gate/up and fused gate_up_proj tensor layouts.
+    /// Supports fused QKV (attn_qkv.weight) and fused gate_up projection layouts.
     /// </summary>
     public sealed unsafe class PhiWeights : IDisposable
     {
@@ -26,14 +26,19 @@ namespace ChatNet.Core.Models.Phi
         private readonly byte*[] _ffnUpWeight;
         private readonly byte*[] _ffnDownWeight;
 
+        // Fused QKV for Phi-3
+        private readonly byte*[] _attnQkvWeight;
+        private bool _hasFusedQkv;
+
         // Fused gate_up for Phi-3
         private readonly byte*[] _ffnGateUpWeight;
-        private readonly bool _hasFusedGateUp;
+        private bool _hasFusedGateUp;
 
         public GgmlType[] AttnQType { get; }
         public GgmlType[] AttnKType { get; }
         public GgmlType[] AttnVType { get; }
         public GgmlType[] AttnOutputType { get; }
+        public GgmlType[] AttnQkvType { get; }
         public GgmlType[] FfnGateType { get; }
         public GgmlType[] FfnUpType { get; }
         public GgmlType[] FfnDownType { get; }
@@ -47,6 +52,7 @@ namespace ChatNet.Core.Models.Phi
         private byte* _finalNormWeight;
         private int _finalNormSize;
 
+        public bool HasFusedQkv => _hasFusedQkv;
         public bool HasFusedGateUp => _hasFusedGateUp;
 
         public PhiWeights(MemoryMappedWeights weights, PhiConfig config)
@@ -59,6 +65,7 @@ namespace ChatNet.Core.Models.Phi
             _attnKWeight = new byte*[layers];
             _attnVWeight = new byte*[layers];
             _attnOutputWeight = new byte*[layers];
+            _attnQkvWeight = new byte*[layers];
             _ffnGateWeight = new byte*[layers];
             _ffnUpWeight = new byte*[layers];
             _ffnDownWeight = new byte*[layers];
@@ -68,6 +75,7 @@ namespace ChatNet.Core.Models.Phi
             AttnKType = new GgmlType[layers];
             AttnVType = new GgmlType[layers];
             AttnOutputType = new GgmlType[layers];
+            AttnQkvType = new GgmlType[layers];
             FfnGateType = new GgmlType[layers];
             FfnUpType = new GgmlType[layers];
             FfnDownType = new GgmlType[layers];
@@ -76,13 +84,12 @@ namespace ChatNet.Core.Models.Phi
             _attnNormSize = new int[layers];
             _ffnNormSize = new int[layers];
 
-            _hasFusedGateUp = ResolveAll(weights, config);
+            ResolveAll(weights, config);
         }
 
-        private bool ResolveAll(MemoryMappedWeights w, PhiConfig config)
+        private void ResolveAll(MemoryMappedWeights w, PhiConfig config)
         {
             int layers = config.LayerCount;
-            bool hasFusedGateUp = false;
 
             GgufTensorInfo embInfo = w.GetTensorInfo(PhiTensorNames.Embedding);
             EmbeddingType = embInfo.Type;
@@ -115,17 +122,29 @@ namespace ChatNet.Core.Models.Phi
                 _ffnNormWeight[l] = w.GetTensorPointer(ffnNormName);
                 _ffnNormSize[l] = (int)w.GetTensorInfo(ffnNormName).ByteSize;
 
-                string aqName = prefix + PhiTensorNames.AttnQSuffix;
-                _attnQWeight[l] = w.GetTensorPointer(aqName);
-                AttnQType[l] = w.GetTensorInfo(aqName).Type;
+                // Check for fused QKV first (Phi-3 pattern)
+                string qkvName = prefix + PhiTensorNames.AttnQkvSuffix;
+                if (w.HasTensor(qkvName))
+                {
+                    _attnQkvWeight[l] = w.GetTensorPointer(qkvName);
+                    AttnQkvType[l] = w.GetTensorInfo(qkvName).Type;
+                    _hasFusedQkv = true;
+                }
+                else
+                {
+                    // Fallback to separate Q/K/V
+                    string aqName = prefix + PhiTensorNames.AttnQSuffix;
+                    _attnQWeight[l] = w.GetTensorPointer(aqName);
+                    AttnQType[l] = w.GetTensorInfo(aqName).Type;
 
-                string akName = prefix + PhiTensorNames.AttnKSuffix;
-                _attnKWeight[l] = w.GetTensorPointer(akName);
-                AttnKType[l] = w.GetTensorInfo(akName).Type;
+                    string akName = prefix + PhiTensorNames.AttnKSuffix;
+                    _attnKWeight[l] = w.GetTensorPointer(akName);
+                    AttnKType[l] = w.GetTensorInfo(akName).Type;
 
-                string avName = prefix + PhiTensorNames.AttnVSuffix;
-                _attnVWeight[l] = w.GetTensorPointer(avName);
-                AttnVType[l] = w.GetTensorInfo(avName).Type;
+                    string avName = prefix + PhiTensorNames.AttnVSuffix;
+                    _attnVWeight[l] = w.GetTensorPointer(avName);
+                    AttnVType[l] = w.GetTensorInfo(avName).Type;
+                }
 
                 string aoName = prefix + PhiTensorNames.AttnOutputSuffix;
                 _attnOutputWeight[l] = w.GetTensorPointer(aoName);
@@ -141,22 +160,29 @@ namespace ChatNet.Core.Models.Phi
                 {
                     _ffnGateUpWeight[l] = w.GetTensorPointer(fguName);
                     FfnGateUpType[l] = w.GetTensorInfo(fguName).Type;
-                    hasFusedGateUp = true;
+                    _hasFusedGateUp = true;
                 }
                 else
                 {
-                    // Use split gate and up
-                    string fgName = prefix + PhiTensorNames.FfnGateSuffix;
-                    _ffnGateWeight[l] = w.GetTensorPointer(fgName);
-                    FfnGateType[l] = w.GetTensorInfo(fgName).Type;
-
+                    // Check if ffn_up is actually fused gate_up (Phi-3 sometimes stores fused as ffn_up)
                     string fuName = prefix + PhiTensorNames.FfnUpSuffix;
-                    _ffnUpWeight[l] = w.GetTensorPointer(fuName);
-                    FfnUpType[l] = w.GetTensorInfo(fuName).Type;
+                    string fgName = prefix + PhiTensorNames.FfnGateSuffix;
+                    if (w.HasTensor(fgName))
+                    {
+                        _ffnGateWeight[l] = w.GetTensorPointer(fgName);
+                        FfnGateType[l] = w.GetTensorInfo(fgName).Type;
+                        _ffnUpWeight[l] = w.GetTensorPointer(fuName);
+                        FfnUpType[l] = w.GetTensorInfo(fuName).Type;
+                    }
+                    else
+                    {
+                        // Only ffn_up exists - treat as fused gate_up
+                        _ffnGateUpWeight[l] = w.GetTensorPointer(fuName);
+                        FfnGateUpType[l] = w.GetTensorInfo(fuName).Type;
+                        _hasFusedGateUp = true;
+                    }
                 }
             }
-
-            return hasFusedGateUp;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public ReadOnlySpan<byte> GetEmbeddingData() => new ReadOnlySpan<byte>(_embeddingPtr, _embeddingByteSize);
@@ -166,6 +192,7 @@ namespace ChatNet.Core.Models.Phi
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetAttnQWeight(int layer) => _attnQWeight[layer];
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetAttnKWeight(int layer) => _attnKWeight[layer];
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetAttnVWeight(int layer) => _attnVWeight[layer];
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetAttnQkvWeight(int layer) => _attnQkvWeight[layer];
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetAttnOutputWeight(int layer) => _attnOutputWeight[layer];
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetFfnGateWeight(int layer) => _ffnGateWeight[layer];
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetFfnUpWeight(int layer) => _ffnUpWeight[layer];

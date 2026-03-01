@@ -86,15 +86,27 @@ namespace ChatNet.Core.Gguf
             {
                 int val = Metadata.GetInt32(arch + "." + suffix, -1);
                 if (val >= 0) return val;
-                // Try common aliases
                 return Metadata.GetInt32(suffix, defaultValue);
             }
 
+            // Helper to read float with architecture-specific key, then bare key fallback.
+            // Uses TryGet to handle the case where the value is stored as int/uint.
             float GetArchFloat(string suffix, float defaultValue)
             {
-                float val = Metadata.GetFloat32(arch + "." + suffix, float.NaN);
-                if (!float.IsNaN(val)) return val;
-                return Metadata.GetFloat32(suffix, defaultValue);
+                string archKey = arch + "." + suffix;
+                if (Metadata.TryGet<float>(archKey, out float fv)) return fv;
+                if (Metadata.TryGet<double>(archKey, out double dv)) return (float)dv;
+                // Some quantizers store freq_base as int
+                if (Metadata.TryGet<uint>(archKey, out uint uv)) return uv;
+                if (Metadata.TryGet<int>(archKey, out int iv)) return iv;
+
+                // Fallback to bare key
+                if (Metadata.TryGet<float>(suffix, out fv)) return fv;
+                if (Metadata.TryGet<double>(suffix, out dv)) return (float)dv;
+                if (Metadata.TryGet<uint>(suffix, out uv)) return uv;
+                if (Metadata.TryGet<int>(suffix, out iv)) return iv;
+
+                return defaultValue;
             }
 
             var config = new ModelConfig
@@ -111,6 +123,9 @@ namespace ChatNet.Core.Gguf
                 RmsNormEpsilon = GetArchFloat("attention.layer_norm_rms_epsilon", 1e-5f),
                 BosTokenId = Metadata.GetInt32("tokenizer.ggml.bos_token_id", 1),
                 EosTokenId = Metadata.GetInt32("tokenizer.ggml.eos_token_id", 2),
+                // Gemma 2 soft-capping
+                AttnLogitSoftcap = GetArchFloat("attn_logit_softcapping", 0f),
+                FinalLogitSoftcap = GetArchFloat("final_logit_softcapping", 0f),
             };
 
             config.HeadDim = config.EmbeddingDim / config.AttentionHeadCount;

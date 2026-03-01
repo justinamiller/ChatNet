@@ -8,7 +8,7 @@ namespace ChatNet.Core.Models.Gemma
 {
     /// <summary>
     /// Weight tensor storage for Gemma model.
-    /// Handles the case where output.weight may not exist (tied to embeddings).
+    /// Handles tied embeddings, and Gemma 2 post-norms.
     /// </summary>
     public sealed unsafe class GemmaWeights : IDisposable
     {
@@ -25,6 +25,13 @@ namespace ChatNet.Core.Models.Gemma
         private readonly byte*[] _ffnGateWeight;
         private readonly byte*[] _ffnUpWeight;
         private readonly byte*[] _ffnDownWeight;
+
+        // Gemma 2 post-norm weights
+        private readonly byte*[] _postAttnNormWeight;
+        private readonly byte*[] _postFfnNormWeight;
+        private readonly int[] _postAttnNormSize;
+        private readonly int[] _postFfnNormSize;
+        public bool HasPostNorms { get; private set; }
 
         public GgmlType[] AttnQType { get; }
         public GgmlType[] AttnKType { get; }
@@ -56,6 +63,10 @@ namespace ChatNet.Core.Models.Gemma
             _ffnGateWeight = new byte*[layers];
             _ffnUpWeight = new byte*[layers];
             _ffnDownWeight = new byte*[layers];
+            _postAttnNormWeight = new byte*[layers];
+            _postFfnNormWeight = new byte*[layers];
+            _postAttnNormSize = new int[layers];
+            _postFfnNormSize = new int[layers];
 
             AttnQType = new GgmlType[layers];
             AttnKType = new GgmlType[layers];
@@ -80,7 +91,6 @@ namespace ChatNet.Core.Models.Gemma
             _embeddingPtr = w.GetTensorPointer(GemmaTensorNames.Embedding);
             _embeddingByteSize = (int)embInfo.ByteSize;
 
-            // Gemma often ties output to embeddings
             if (w.HasTensor(GemmaTensorNames.Output))
             {
                 OutputType = w.GetTensorInfo(GemmaTensorNames.Output).Type;
@@ -108,6 +118,22 @@ namespace ChatNet.Core.Models.Gemma
                 string ffnNormName = prefix + GemmaTensorNames.FfnNormSuffix;
                 _ffnNormWeight[l] = w.GetTensorPointer(ffnNormName);
                 _ffnNormSize[l] = (int)w.GetTensorInfo(ffnNormName).ByteSize;
+
+                // Gemma 2 post-norms (optional)
+                string postAttnNormName = prefix + GemmaTensorNames.PostAttnNormSuffix;
+                if (w.HasTensor(postAttnNormName))
+                {
+                    _postAttnNormWeight[l] = w.GetTensorPointer(postAttnNormName);
+                    _postAttnNormSize[l] = (int)w.GetTensorInfo(postAttnNormName).ByteSize;
+                    HasPostNorms = true;
+                }
+
+                string postFfnNormName = prefix + GemmaTensorNames.PostFfnNormSuffix;
+                if (w.HasTensor(postFfnNormName))
+                {
+                    _postFfnNormWeight[l] = w.GetTensorPointer(postFfnNormName);
+                    _postFfnNormSize[l] = (int)w.GetTensorInfo(postFfnNormName).ByteSize;
+                }
 
                 string aqName = prefix + GemmaTensorNames.AttnQSuffix;
                 _attnQWeight[l] = w.GetTensorPointer(aqName);
@@ -137,11 +163,16 @@ namespace ChatNet.Core.Models.Gemma
                 _ffnDownWeight[l] = w.GetTensorPointer(fdName);
                 FfnDownType[l] = w.GetTensorInfo(fdName).Type;
             }
+
+            // Propagate to config
+            config.HasPostNorms = HasPostNorms;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public ReadOnlySpan<byte> GetEmbeddingData() => new ReadOnlySpan<byte>(_embeddingPtr, _embeddingByteSize);
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public ReadOnlySpan<byte> GetAttnNormWeight(int layer) => new ReadOnlySpan<byte>(_attnNormWeight[layer], _attnNormSize[layer]);
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public ReadOnlySpan<byte> GetFfnNormWeight(int layer) => new ReadOnlySpan<byte>(_ffnNormWeight[layer], _ffnNormSize[layer]);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] public ReadOnlySpan<byte> GetPostAttnNormWeight(int layer) => new ReadOnlySpan<byte>(_postAttnNormWeight[layer], _postAttnNormSize[layer]);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)] public ReadOnlySpan<byte> GetPostFfnNormWeight(int layer) => new ReadOnlySpan<byte>(_postFfnNormWeight[layer], _postFfnNormSize[layer]);
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public ReadOnlySpan<byte> GetFinalNormWeight() => new ReadOnlySpan<byte>(_finalNormWeight, _finalNormSize);
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetAttnQWeight(int layer) => _attnQWeight[layer];
         [MethodImpl(MethodImplOptions.AggressiveInlining)] public byte* GetAttnKWeight(int layer) => _attnKWeight[layer];

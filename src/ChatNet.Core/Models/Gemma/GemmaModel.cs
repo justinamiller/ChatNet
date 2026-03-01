@@ -17,6 +17,10 @@ namespace ChatNet.Core.Models.Gemma
     /// 2) RMSNorm weights have +1 offset (stored as delta from 1.0)
     /// 3) GELU activation instead of SiLU in the gated FFN
     /// 4) Output may be tied to embeddings (no separate output.weight)
+    /// Gemma 2 additions:
+    /// 5) Post-attention and post-FFN norms
+    /// 6) Attention logit soft-capping
+    /// 7) Final logit soft-capping
     /// </summary>
     public sealed class GemmaModel : IModel
     {
@@ -78,19 +82,22 @@ namespace ChatNet.Core.Models.Gemma
             int hiddenDim = _cfg.HiddenDim;
             int vocabSize = _cfg.VocabSize;
             float embScale = _cfg.EmbeddingScale;
+            bool hasPostNorms = _cfg.HasPostNorms;
+            float attnSoftcap = _cfg.AttnLogitSoftcap;
+            float finalSoftcap = _cfg.FinalLogitSoftcap;
 
             for (int t = 0; t < tokenIds.Length; t++)
             {
                 int tokenId = tokenIds[t];
                 int pos = position + t;
 
-                // Gemma difference #1: embedding scaled by sqrt(dim)
+                // Gemma: embedding scaled by sqrt(dim)
                 LoadEmbedding(tokenId, _x.AsSpan(0, dim));
                 ScaleVector(_x.AsSpan(0, dim), embScale);
 
                 for (int l = 0; l < layers; l++)
                 {
-                    // Gemma difference #2: RMSNorm with +1 offset on weights
+                    // Pre-attention RMSNorm with +1 offset
                     ReadOnlySpan<float> attnNormW = GetF32Weights(_weights.GetAttnNormWeight(l), dim);
                     TensorMath.RmsNormWithOffset(_x.AsSpan(0, dim), attnNormW, _xNorm.AsSpan(0, dim), _cfg.RmsNormEps);
 
@@ -112,7 +119,7 @@ namespace ChatNet.Core.Models.Gemma
                     Array.Copy(_k, 0, _keyCache, kvCachePos, kvDim);
                     Array.Copy(_v, 0, _valueCache, kvCachePos, kvDim);
 
-                    ComputeAttention(l, pos, headDim, nHeads, nKvHeads, kvMul, kvDim, dim);
+                    ComputeAttention(l, pos, headDim, nHeads, nKvHeads, kvMul, kvDim, dim, attnSoftcap);
 
                     unsafe
                     {
@@ -120,9 +127,16 @@ namespace ChatNet.Core.Models.Gemma
                             _attnOut.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim, dim);
                     }
 
+                    // Gemma 2: post-attention norm
+                    if (hasPostNorms)
+                    {
+                        ReadOnlySpan<float> postAttnW = GetF32Weights(_weights.GetPostAttnNormWeight(l), dim);
+                        TensorMath.RmsNormWithOffset(_ffnOut.AsSpan(0, dim), postAttnW, _ffnOut.AsSpan(0, dim), _cfg.RmsNormEps);
+                    }
+
                     TensorMath.Add(_x.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim);
 
-                    // Gemma difference #2: RMSNorm with +1 offset on weights
+                    // Pre-FFN RMSNorm with +1 offset
                     ReadOnlySpan<float> ffnNormW = GetF32Weights(_weights.GetFfnNormWeight(l), dim);
                     TensorMath.RmsNormWithOffset(_x.AsSpan(0, dim), ffnNormW, _xNorm.AsSpan(0, dim), _cfg.RmsNormEps);
 
@@ -134,7 +148,7 @@ namespace ChatNet.Core.Models.Gemma
                             _xNorm.AsSpan(0, dim), _up.AsSpan(0, hiddenDim), hiddenDim, dim);
                     }
 
-                    // Gemma difference #3: GELU activation instead of SiLU
+                    // GELU activation instead of SiLU
                     TensorMath.GeluElementwiseMul(_gate.AsSpan(0, hiddenDim), _up.AsSpan(0, hiddenDim), hiddenDim);
 
                     unsafe
@@ -143,10 +157,17 @@ namespace ChatNet.Core.Models.Gemma
                             _gate.AsSpan(0, hiddenDim), _ffnOut.AsSpan(0, dim), dim, hiddenDim);
                     }
 
+                    // Gemma 2: post-FFN norm
+                    if (hasPostNorms)
+                    {
+                        ReadOnlySpan<float> postFfnW = GetF32Weights(_weights.GetPostFfnNormWeight(l), dim);
+                        TensorMath.RmsNormWithOffset(_ffnOut.AsSpan(0, dim), postFfnW, _ffnOut.AsSpan(0, dim), _cfg.RmsNormEps);
+                    }
+
                     TensorMath.Add(_x.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim);
                 }
 
-                // Gemma difference #2: Final norm also uses +1 offset
+                // Final norm with +1 offset
                 ReadOnlySpan<float> finalNormW = GetF32Weights(_weights.GetFinalNormWeight(), dim);
                 TensorMath.RmsNormWithOffset(_x.AsSpan(0, dim), finalNormW, _xNorm.AsSpan(0, dim), _cfg.RmsNormEps);
 
@@ -157,8 +178,24 @@ namespace ChatNet.Core.Models.Gemma
                         MatVecMulByType(_weights.GetOutputWeight(), _weights.OutputType,
                             _xNorm.AsSpan(0, dim), logits, vocabSize, dim);
                     }
+
+                    // Gemma 2: final logit soft-capping
+                    if (finalSoftcap > 0f)
+                        ApplySoftcap(logits.Slice(0, vocabSize), finalSoftcap);
                 }
             }
+        }
+
+        /// <summary>
+        /// Logit soft-capping: logits = cap * tanh(logits / cap)
+        /// Constrains logits to [-cap, cap] range.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void ApplySoftcap(Span<float> logits, float cap)
+        {
+            float invCap = 1.0f / cap;
+            for (int i = 0; i < logits.Length; i++)
+                logits[i] = cap * MathF.Tanh(logits[i] * invCap);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -182,12 +219,14 @@ namespace ChatNet.Core.Models.Gemma
         }
 
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private unsafe void ComputeAttention(int layer, int pos, int headDim, int nHeads, int nKvHeads, int kvMul, int kvDim, int dim)
+        private unsafe void ComputeAttention(int layer, int pos, int headDim, int nHeads, int nKvHeads, int kvMul, int kvDim, int dim, float softcap)
         {
             int maxSeq = _cfg.ContextLength;
             int kvCacheLayerOffset = layer * maxSeq * kvDim;
             int seqLen = pos + 1;
             float scale = 1.0f / MathF.Sqrt(headDim);
+            bool useSoftcap = softcap > 0f;
+            float invSoftcap = useSoftcap ? 1.0f / softcap : 0f;
 
             fixed (float* pQ = _q)
             fixed (float* pKeyCache = _keyCache)
@@ -226,7 +265,13 @@ namespace ChatNet.Core.Models.Gemma
                             score = VectorSumFast(vAcc0 + vAcc1);
                         }
                         for (; d < headDim; d++) score += qPtr[d] * kPtr[d];
-                        pAttnScores[p] = score * scale;
+                        score *= scale;
+
+                        // Gemma 2: attention logit soft-capping
+                        if (useSoftcap)
+                            score = softcap * MathF.Tanh(score * invSoftcap);
+
+                        pAttnScores[p] = score;
                     }
 
                     TensorMath.Softmax(new Span<float>(pAttnScores, seqLen), seqLen);

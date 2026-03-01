@@ -16,6 +16,9 @@ namespace ChatNet.Core.Models.Phi
         public const string AttnVSuffix = ".attn_v.weight";
         public const string AttnOutputSuffix = ".attn_output.weight";
 
+        // Phi-3 uses fused QKV projection as a single tensor
+        public const string AttnQkvSuffix = ".attn_qkv.weight";
+
         public const string FfnNormSuffix = ".ffn_norm.weight";
         public const string FfnGateSuffix = ".ffn_gate.weight";
         public const string FfnUpSuffix = ".ffn_up.weight";

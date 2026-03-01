@@ -20,6 +20,10 @@ namespace ChatNet.Core.Models.Gemma
         public const string FfnUpSuffix = ".ffn_up.weight";
         public const string FfnDownSuffix = ".ffn_down.weight";
 
+        // Gemma 2 post-norm weights
+        public const string PostAttnNormSuffix = ".post_attention_norm.weight";
+        public const string PostFfnNormSuffix = ".post_ffw_norm.weight";
+
         public const string BlockPrefix = "blk.";
 
         public static string LayerName(int layer, string suffix)

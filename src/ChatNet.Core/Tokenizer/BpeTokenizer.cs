@@ -18,6 +18,7 @@ namespace ChatNet.Core.Tokenizer
         private readonly TokenVocab _vocab;
         private readonly int _bosToken;
         private readonly int _eosToken;
+        private readonly bool _addBosToken;
 
         // Byte fallback tokens: maps byte value (0-255) -> token ID for "<0xHH>" tokens
         private readonly int[] _byteTokens;
@@ -75,6 +76,14 @@ namespace ChatNet.Core.Tokenizer
             _vocab = new TokenVocab(tokens, scores, tokenTypes);
             _bosToken = metadata.GetInt32("tokenizer.ggml.bos_token_id", 1);
             _eosToken = metadata.GetInt32("tokenizer.ggml.eos_token_id", 2);
+            // Some models (e.g., Qwen) set add_bos_token=false - respect this flag.
+            // The value may be stored as bool, byte, or int in different GGUF producers.
+            if (metadata.TryGet<bool>("tokenizer.ggml.add_bos_token", out bool addBos))
+                _addBosToken = addBos;
+            else if (metadata.TryGet<byte>("tokenizer.ggml.add_bos_token", out byte addBosByte))
+                _addBosToken = addBosByte != 0;
+            else
+                _addBosToken = true; // default: prepend BOS (Llama behavior)
 
             // Build byte fallback mapping
             _byteTokens = new int[256];
@@ -188,21 +197,24 @@ namespace ChatNet.Core.Tokenizer
         /// <summary>
         /// Encode text to token IDs using SentencePiece-style BPE.
         /// Uses trie-based single-pass scanning for special/control tokens (refactor item 2).
-        /// Prepends BOS token. Returns number of tokens written.
+        /// Conditionally prepends BOS token based on tokenizer.ggml.add_bos_token metadata.
+        /// Returns number of tokens written.
         /// </summary>
         public int Encode(ReadOnlySpan<char> text, Span<int> outputTokens)
         {
             // Output capacity check (refactor item 5)
             if (outputTokens.Length == 0) return 0;
 
-            if (text.Length == 0)
+            int pos = 0;
+            if (_addBosToken)
             {
-                outputTokens[0] = _bosToken;
-                return 1;
+                outputTokens[pos++] = _bosToken;
             }
 
-            int pos = 0;
-            outputTokens[pos++] = _bosToken;
+            if (text.Length == 0)
+            {
+                return pos;
+            }
 
             if (!_hasSpecialTokens)
             {
