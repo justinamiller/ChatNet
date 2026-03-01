@@ -22,6 +22,10 @@ namespace ChatNet.Core.Tokenizer
         // Key = hash of (left + right), Value = list of (leftLen, tokenId) pairs to disambiguate collisions.
         private readonly Dictionary<int, MergeBucket> _mergeMap;
 
+        // Int-based merge lookup: (leftTokenId, rightTokenId) -> merged tokenId.
+        // Avoids string operations entirely in the BPE merge loop hot path.
+        private readonly Dictionary<long, int> _mergeMapById;
+
         public TokenVocab(string[] tokens, float[] scores, int[]? tokenTypes)
         {
             Tokens = tokens;
@@ -42,6 +46,7 @@ namespace ChatNet.Core.Tokenizer
             // Build merge map: for each token that could be the result of merging two
             // existing tokens, record it keyed by the hash of the concatenation.
             _mergeMap = new Dictionary<int, MergeBucket>(tokens.Length);
+            _mergeMapById = new Dictionary<long, int>(tokens.Length);
             for (int i = 0; i < tokens.Length; i++)
             {
                 string tok = tokens[i];
@@ -53,7 +58,8 @@ namespace ChatNet.Core.Tokenizer
                     string left = tok.Substring(0, s);
                     string right = tok.Substring(s);
 
-                    if (_tokenToId.ContainsKey(left) && _tokenToId.ContainsKey(right))
+                    if (_tokenToId.TryGetValue(left, out int leftId) &&
+                        _tokenToId.TryGetValue(right, out int rightId))
                     {
                         int hash = ConcatHash(left, right);
                         if (!_mergeMap.TryGetValue(hash, out var bucket))
@@ -62,6 +68,10 @@ namespace ChatNet.Core.Tokenizer
                             _mergeMap[hash] = bucket;
                         }
                         bucket.Add(left, right, i);
+
+                        // Int-based merge map: first registration wins (matches _tokenToId)
+                        long byIdKey = ((long)leftId << 32) | (uint)rightId;
+                        _mergeMapById.TryAdd(byIdKey, i);
                     }
                 }
             }
@@ -90,6 +100,17 @@ namespace ChatNet.Core.Tokenizer
                 return bucket.Lookup(left, right);
             }
             return -1;
+        }
+
+        /// <summary>
+        /// Look up the merged token ID for a pair of token IDs without any string operations.
+        /// Returns -1 if not found.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int GetMergeTokenIdById(int leftId, int rightId)
+        {
+            long key = ((long)leftId << 32) | (uint)rightId;
+            return _mergeMapById.TryGetValue(key, out int resultId) ? resultId : -1;
         }
 
         /// <summary>Check if a token string exists in vocab.</summary>
