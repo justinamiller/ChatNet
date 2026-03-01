@@ -26,7 +26,7 @@ namespace ChatNet.Core.Tensors.Quantization
         /// Maps 4-bit indices (0..15) to float values.
         /// From llama.cpp kvalues_iq4nl.
         /// </summary>
-        internal static readonly float[] IQ4NL_Table = new float[]
+        public static readonly float[] IQ4NL_Table = new float[]
         {
             -127, -104, -83, -65, -49, -35, -22, -10,
             1, 13, 25, 38, 53, 69, 89, 113
