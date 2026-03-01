@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 namespace ChatNet.Core.Tensors.Quantization
 {
@@ -45,7 +46,6 @@ namespace ChatNet.Core.Tensors.Quantization
                     quantizedData[srcOffset + DOffset],
                     quantizedData[srcOffset + DOffset + 1]);
 
-                // Process 256 elements in two halves of 128
                 int qlBase = srcOffset + QlOffset;
                 int qhBase = srcOffset + QhOffset;
                 int scBase = srcOffset + ScalesOffset;
@@ -54,7 +54,7 @@ namespace ChatNet.Core.Tensors.Quantization
                 {
                     int qlOff = qlBase + half * 64;
                     int qhOff = qhBase + half * 32;
-                    int scOff = half * 8; // scale index offset
+                    int scOff = half * 8;
 
                     for (int l = 0; l < 32; l++)
                     {
@@ -89,10 +89,106 @@ namespace ChatNet.Core.Tensors.Quantization
 
         /// <summary>
         /// Fused dequant + dot product for a single Q6_K row against a float vector.
-        /// Avoids materializing the full dequantized row.
+        /// Uses Vector128 SIMD for the multiply-accumulate.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe float DotProduct(byte* quantizedRow, float* input, int elementCount)
+        {
+            if (Vector128.IsHardwareAccelerated)
+                return DotProductVec128(quantizedRow, input, elementCount);
+
+            return DotProductScalar(quantizedRow, input, elementCount);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float DotProductVec128(byte* data, float* input, int elementCount)
+        {
+            int blockCount = elementCount / BlockSize;
+            int srcOffset = 0;
+            int inputIdx = 0;
+
+            var acc = Vector128<float>.Zero;
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                float d = DequantQ4_0.HalfToFloat(
+                    data[srcOffset + DOffset],
+                    data[srcOffset + DOffset + 1]);
+
+                int qlBase = srcOffset + QlOffset;
+                int qhBase = srcOffset + QhOffset;
+                int scBase = srcOffset + ScalesOffset;
+
+                var blockAcc = Vector128<float>.Zero;
+
+                for (int half = 0; half < 2; half++)
+                {
+                    int qlOff = qlBase + half * 64;
+                    int qhOff = qhBase + half * 32;
+                    int scOff = half * 8;
+                    int inBase = inputIdx + half * 128;
+
+                    // Process l=0..15 (scale index = scOff+0) and l=16..31 (scale index = scOff+1)
+                    for (int lBlock = 0; lBlock < 2; lBlock++)
+                    {
+                        int lStart = lBlock * 16;
+                        int scIdx = scOff + lBlock;
+                        float fSc0 = (sbyte)data[scBase + scIdx];
+                        float fSc2 = (sbyte)data[scBase + scIdx + 2];
+                        float fSc4 = (sbyte)data[scBase + scIdx + 4];
+                        float fSc6 = (sbyte)data[scBase + scIdx + 6];
+                        var vSc0 = Vector128.Create(fSc0);
+                        var vSc2 = Vector128.Create(fSc2);
+                        var vSc4 = Vector128.Create(fSc4);
+                        var vSc6 = Vector128.Create(fSc6);
+
+                        for (int l = lStart; l < lStart + 16; l += 4)
+                        {
+                            // q1 lane: elements at position l+0..l+3
+                            var q1 = Vector128.Create(
+                                (float)(((data[qlOff + l] & 0xF) | (((data[qhOff + l] >> 0) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 1] & 0xF) | (((data[qhOff + l + 1] >> 0) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 2] & 0xF) | (((data[qhOff + l + 2] >> 0) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 3] & 0xF) | (((data[qhOff + l + 3] >> 0) & 3) << 4)) - 32));
+                            blockAcc += q1 * vSc0 * Vector128.Load(input + inBase + l);
+
+                            // q2 lane: elements at position l+32..l+35
+                            var q2 = Vector128.Create(
+                                (float)(((data[qlOff + l + 32] & 0xF) | (((data[qhOff + l] >> 2) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 33] & 0xF) | (((data[qhOff + l + 1] >> 2) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 34] & 0xF) | (((data[qhOff + l + 2] >> 2) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 35] & 0xF) | (((data[qhOff + l + 3] >> 2) & 3) << 4)) - 32));
+                            blockAcc += q2 * vSc2 * Vector128.Load(input + inBase + l + 32);
+
+                            // q3 lane: elements at position l+64..l+67
+                            var q3 = Vector128.Create(
+                                (float)(((data[qlOff + l] >> 4) | (((data[qhOff + l] >> 4) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 1] >> 4) | (((data[qhOff + l + 1] >> 4) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 2] >> 4) | (((data[qhOff + l + 2] >> 4) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 3] >> 4) | (((data[qhOff + l + 3] >> 4) & 3) << 4)) - 32));
+                            blockAcc += q3 * vSc4 * Vector128.Load(input + inBase + l + 64);
+
+                            // q4 lane: elements at position l+96..l+99
+                            var q4 = Vector128.Create(
+                                (float)(((data[qlOff + l + 32] >> 4) | (((data[qhOff + l] >> 6) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 33] >> 4) | (((data[qhOff + l + 1] >> 6) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 34] >> 4) | (((data[qhOff + l + 2] >> 6) & 3) << 4)) - 32),
+                                (float)(((data[qlOff + l + 35] >> 4) | (((data[qhOff + l + 3] >> 6) & 3) << 4)) - 32));
+                            blockAcc += q4 * vSc6 * Vector128.Load(input + inBase + l + 96);
+                        }
+                    }
+                }
+
+                acc += blockAcc * Vector128.Create(d);
+                srcOffset += BytesPerBlock;
+                inputIdx += BlockSize;
+            }
+
+            return Vector128.Sum(acc);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float DotProductScalar(byte* data, float* input, int elementCount)
         {
             float sum = 0f;
             int blockCount = elementCount / BlockSize;
@@ -102,8 +198,8 @@ namespace ChatNet.Core.Tensors.Quantization
             for (int b = 0; b < blockCount; b++)
             {
                 float d = DequantQ4_0.HalfToFloat(
-                    quantizedRow[srcOffset + DOffset],
-                    quantizedRow[srcOffset + DOffset + 1]);
+                    data[srcOffset + DOffset],
+                    data[srcOffset + DOffset + 1]);
 
                 int qlBase = srcOffset + QlOffset;
                 int qhBase = srcOffset + QhOffset;
@@ -122,19 +218,19 @@ namespace ChatNet.Core.Tensors.Quantization
                     {
                         int scIdx = scOff + l / 16;
 
-                        int q1 = ((quantizedRow[qlOff + l] & 0x0F) |
-                                  (((quantizedRow[qhOff + l] >> 0) & 3) << 4)) - 32;
-                        int q2 = ((quantizedRow[qlOff + l + 32] & 0x0F) |
-                                  (((quantizedRow[qhOff + l] >> 2) & 3) << 4)) - 32;
-                        int q3 = ((quantizedRow[qlOff + l] >> 4) |
-                                  (((quantizedRow[qhOff + l] >> 4) & 3) << 4)) - 32;
-                        int q4 = ((quantizedRow[qlOff + l + 32] >> 4) |
-                                  (((quantizedRow[qhOff + l] >> 6) & 3) << 4)) - 32;
+                        int q1 = ((data[qlOff + l] & 0x0F) |
+                                  (((data[qhOff + l] >> 0) & 3) << 4)) - 32;
+                        int q2 = ((data[qlOff + l + 32] & 0x0F) |
+                                  (((data[qhOff + l] >> 2) & 3) << 4)) - 32;
+                        int q3 = ((data[qlOff + l] >> 4) |
+                                  (((data[qhOff + l] >> 4) & 3) << 4)) - 32;
+                        int q4 = ((data[qlOff + l + 32] >> 4) |
+                                  (((data[qhOff + l] >> 6) & 3) << 4)) - 32;
 
-                        sbyte sc0 = (sbyte)quantizedRow[scBase + scIdx];
-                        sbyte sc2 = (sbyte)quantizedRow[scBase + scIdx + 2];
-                        sbyte sc4 = (sbyte)quantizedRow[scBase + scIdx + 4];
-                        sbyte sc6 = (sbyte)quantizedRow[scBase + scIdx + 6];
+                        sbyte sc0 = (sbyte)data[scBase + scIdx];
+                        sbyte sc2 = (sbyte)data[scBase + scIdx + 2];
+                        sbyte sc4 = (sbyte)data[scBase + scIdx + 4];
+                        sbyte sc6 = (sbyte)data[scBase + scIdx + 6];
 
                         blockSum += sc0 * q1 * input[inBase + l];
                         blockSum += sc2 * q2 * input[inBase + l + 32];

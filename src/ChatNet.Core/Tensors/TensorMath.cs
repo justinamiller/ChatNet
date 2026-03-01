@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using System.Threading.Tasks;
 using ChatNet.Core.Tensors.Quantization;
 
 namespace ChatNet.Core.Tensors
@@ -193,43 +194,54 @@ namespace ChatNet.Core.Tensors
         /// <summary>
         /// Matrix-vector multiply for Q4_0 quantized weights.
         /// weights: raw Q4_0 bytes for [outDim, inDim] matrix.
+        /// Parallelizes across output rows on multi-core machines.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void MatVecMulQ4_0(byte* weights, ReadOnlySpan<float> input,
             Span<float> output, int outDim, int inDim)
         {
-            // Each row of inDim elements is stored as Q4_0 blocks
-            int blocksPerRow = inDim / DequantQ4_0.BlockSize;
-            int bytesPerRow = blocksPerRow * DequantQ4_0.BytesPerBlock;
+            int bytesPerRow = (inDim / DequantQ4_0.BlockSize) * DequantQ4_0.BytesPerBlock;
 
             fixed (float* pInput = input)
+            fixed (float* pOutput = output)
             {
-                for (int row = 0; row < outDim; row++)
+                byte* w = weights;
+                float* pIn = pInput;
+                float* pOut = pOutput;
+                int bpr = bytesPerRow;
+                int dim = inDim;
+
+                Parallel.For(0, outDim, row =>
                 {
-                    byte* rowPtr = weights + (long)row * bytesPerRow;
-                    output[row] = DequantQ4_0.DotProduct(rowPtr, pInput, inDim);
-                }
+                    byte* rowPtr = w + (long)row * bpr;
+                    pOut[row] = DequantQ4_0.DotProduct(rowPtr, pIn, dim);
+                });
             }
         }
 
         /// <summary>
         /// Matrix-vector multiply for Q6_K quantized weights.
         /// weights: raw Q6_K bytes for [outDim, inDim] matrix.
+        /// Parallelizes across output rows on multi-core machines.
         /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe void MatVecMulQ6K(byte* weights, ReadOnlySpan<float> input,
             Span<float> output, int outDim, int inDim)
         {
-            int blocksPerRow = inDim / DequantQ6K.BlockSize;
-            int bytesPerRow = blocksPerRow * DequantQ6K.BytesPerBlock;
+            int bytesPerRow = (inDim / DequantQ6K.BlockSize) * DequantQ6K.BytesPerBlock;
 
             fixed (float* pInput = input)
+            fixed (float* pOutput = output)
             {
-                for (int row = 0; row < outDim; row++)
+                byte* w = weights;
+                float* pIn = pInput;
+                float* pOut = pOutput;
+                int bpr = bytesPerRow;
+                int dim = inDim;
+
+                Parallel.For(0, outDim, row =>
                 {
-                    byte* rowPtr = weights + (long)row * bytesPerRow;
-                    output[row] = DequantQ6K.DotProduct(rowPtr, pInput, inDim);
-                }
+                    byte* rowPtr = w + (long)row * bpr;
+                    pOut[row] = DequantQ6K.DotProduct(rowPtr, pIn, dim);
+                });
             }
         }
 

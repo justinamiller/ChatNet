@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 
 namespace ChatNet.Core.Tensors.Quantization
 {
@@ -62,12 +63,70 @@ namespace ChatNet.Core.Tensors.Quantization
 
         /// <summary>
         /// Fused dequant + dot product for a single Q4_0 row against a float vector.
-        /// This is the hottest path — avoids materializing the full dequantized row.
+        /// Uses Vector128 SIMD (ARM NEON / x86 SSE) for the multiply-accumulate.
         ///
         /// GGML nibble order: low nibbles → positions 0..15, high nibbles → positions 16..31.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe float DotProduct(byte* quantizedRow, float* input, int elementCount)
+        {
+            if (Vector128.IsHardwareAccelerated)
+                return DotProductVec128(quantizedRow, input, elementCount);
+
+            return DotProductScalar(quantizedRow, input, elementCount);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float DotProductVec128(byte* quantizedRow, float* input, int elementCount)
+        {
+            int blockCount = elementCount / BlockSize;
+            byte* src = quantizedRow;
+            float* inp = input;
+
+            var acc = Vector128<float>.Zero;
+
+            for (int b = 0; b < blockCount; b++)
+            {
+                float scale = HalfToFloat(src[0], src[1]);
+                src += 2;
+                var vScale = Vector128.Create(scale);
+
+                var blockAcc = Vector128<float>.Zero;
+
+                // Low nibbles: 16 values at positions 0..15, process 4 at a time
+                for (int j = 0; j < 16; j += 4)
+                {
+                    var q = Vector128.Create(
+                        (float)((src[j] & 0xF) - 8),
+                        (float)((src[j + 1] & 0xF) - 8),
+                        (float)((src[j + 2] & 0xF) - 8),
+                        (float)((src[j + 3] & 0xF) - 8));
+                    var v = Vector128.Load(inp + j);
+                    blockAcc += q * v;
+                }
+
+                // High nibbles: 16 values at positions 16..31, process 4 at a time
+                for (int j = 0; j < 16; j += 4)
+                {
+                    var q = Vector128.Create(
+                        (float)((src[j] >> 4) - 8),
+                        (float)((src[j + 1] >> 4) - 8),
+                        (float)((src[j + 2] >> 4) - 8),
+                        (float)((src[j + 3] >> 4) - 8));
+                    var v = Vector128.Load(inp + 16 + j);
+                    blockAcc += q * v;
+                }
+
+                acc += blockAcc * vScale;
+                src += 16;
+                inp += 32;
+            }
+
+            return Vector128.Sum(acc);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static unsafe float DotProductScalar(byte* quantizedRow, float* input, int elementCount)
         {
             float sum = 0f;
             int blockCount = elementCount / BlockSize;
@@ -76,21 +135,17 @@ namespace ChatNet.Core.Tensors.Quantization
 
             for (int b = 0; b < blockCount; b++)
             {
-                // Read half-float scale
                 float scale = HalfToFloat(quantizedRow[srcOffset], quantizedRow[srcOffset + 1]);
                 srcOffset += 2;
 
-                // Accumulate dot product with correct nibble-to-position mapping
                 float blockSum = 0f;
 
-                // Low nibbles: positions 0..15
                 for (int j = 0; j < 16; j++)
                 {
                     int low = (quantizedRow[srcOffset + j] & 0x0F) - 8;
                     blockSum += low * input[inputIdx + j];
                 }
 
-                // High nibbles: positions 16..31
                 for (int j = 0; j < 16; j++)
                 {
                     int high = ((quantizedRow[srcOffset + j] >> 4) & 0x0F) - 8;
