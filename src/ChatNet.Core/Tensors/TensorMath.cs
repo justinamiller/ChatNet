@@ -213,6 +213,27 @@ namespace ChatNet.Core.Tensors
         }
 
         /// <summary>
+        /// Matrix-vector multiply for Q6_K quantized weights.
+        /// weights: raw Q6_K bytes for [outDim, inDim] matrix.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static unsafe void MatVecMulQ6K(byte* weights, ReadOnlySpan<float> input,
+            Span<float> output, int outDim, int inDim)
+        {
+            int blocksPerRow = inDim / DequantQ6K.BlockSize;
+            int bytesPerRow = blocksPerRow * DequantQ6K.BytesPerBlock;
+
+            fixed (float* pInput = input)
+            {
+                for (int row = 0; row < outDim; row++)
+                {
+                    byte* rowPtr = weights + (long)row * bytesPerRow;
+                    output[row] = DequantQ6K.DotProduct(rowPtr, pInput, inDim);
+                }
+            }
+        }
+
+        /// <summary>
         /// SIMD dot product of two float vectors.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

@@ -298,6 +298,13 @@ namespace ChatNet.Core.Models.Llama
                 int rowOffset = tokenId * bytesPerRow;
                 DequantQ4_0.Dequantize(embData.Slice(rowOffset, bytesPerRow), output, dim);
             }
+            else if (_weights.EmbeddingType == GgmlType.Q6K)
+            {
+                int blocksPerRow = dim / DequantQ6K.BlockSize;
+                int bytesPerRow = blocksPerRow * DequantQ6K.BytesPerBlock;
+                int rowOffset = tokenId * bytesPerRow;
+                DequantQ6K.Dequantize(embData.Slice(rowOffset, bytesPerRow), output, dim);
+            }
             else if (_weights.EmbeddingType == GgmlType.F16)
             {
                 int offset = tokenId * dim * 2;
@@ -319,6 +326,10 @@ namespace ChatNet.Core.Models.Llama
             if (type == GgmlType.Q4_0)
             {
                 TensorMath.MatVecMulQ4_0(weights, input, output, outDim, inDim);
+            }
+            else if (type == GgmlType.Q6K)
+            {
+                TensorMath.MatVecMulQ6K(weights, input, output, outDim, inDim);
             }
             else if (type == GgmlType.F32)
             {

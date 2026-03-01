@@ -46,6 +46,32 @@ namespace ChatNet.Core.Gguf
                     case GgmlType.Q8_0:
                         blocks = (elements + 31) / 32;
                         return blocks * 34; // 2 scale + 32 data
+                    case GgmlType.Q6K:
+                        // Q6_K: super-blocks of 256 elements
+                        // ql[128] + qh[64] + scales[16] + d[2] = 210 bytes
+                        blocks = (elements + 255) / 256;
+                        return blocks * 210;
+                    case GgmlType.Q5_0:
+                        blocks = (elements + 31) / 32;
+                        return blocks * 22; // 2 scale + 4 high-bits + 16 data
+                    case GgmlType.Q5_1:
+                        blocks = (elements + 31) / 32;
+                        return blocks * 24; // 2 scale + 2 min + 4 high-bits + 16 data
+                    case GgmlType.Q2K:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 84; // 256/16*2 scales + 256/4 quants + 2 d + 2 dmin
+                    case GgmlType.Q3K:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 110;
+                    case GgmlType.Q4K:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 144;
+                    case GgmlType.Q5K:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 176;
+                    case GgmlType.Q8K:
+                        blocks = (elements + 255) / 256;
+                        return blocks * 292;
                     default:
                         return elements * 4; // fallback
                 }
