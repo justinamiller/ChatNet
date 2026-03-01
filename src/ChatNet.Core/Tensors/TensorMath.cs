@@ -33,6 +33,8 @@ namespace ChatNet.Core.Tensors
         private static readonly Action<int> s_q4Body = s_q4State.Execute;
         private static readonly MatVecQ6KState s_q6kState = new();
         private static readonly Action<int> s_q6kBody = s_q6kState.Execute;
+        private static readonly MatVecGenericState s_genericState = new();
+        private static readonly Action<int> s_genericBody = s_genericState.Execute;
 
         private sealed unsafe class MatVecQ4State
         {
@@ -61,6 +63,25 @@ namespace ChatNet.Core.Tensors
             {
                 byte* rowPtr = W + (long)row * Bpr;
                 POut[row] = DequantQ6K.DotProduct(rowPtr, PIn, Dim);
+            }
+        }
+
+        /// <summary>
+        /// Generic state for quantization types that use a delegate-based dot product.
+        /// </summary>
+        private sealed unsafe class MatVecGenericState
+        {
+            public byte* W;
+            public float* PIn;
+            public float* POut;
+            public int Bpr;
+            public int Dim;
+            public delegate*<byte*, float*, int, float> DotFn;
+
+            public void Execute(int row)
+            {
+                byte* rowPtr = W + (long)row * Bpr;
+                POut[row] = DotFn(rowPtr, PIn, Dim);
             }
         }
 
@@ -417,6 +438,46 @@ namespace ChatNet.Core.Tensors
                     {
                         byte* rowPtr = w + (long)row * bytesPerRow;
                         pOut[row] = DequantQ6K.DotProduct(rowPtr, pIn, inDim);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Generic matrix-vector multiply for any quantization type with a fused dot product.
+        /// Uses function pointer to dispatch to the correct dot product implementation.
+        /// Parallelizes across output rows when outDim is large enough.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public static unsafe void MatVecMulGeneric(byte* weights, ReadOnlySpan<float> input,
+            Span<float> output, int outDim, int inDim, int blockSize, int bytesPerBlock,
+            delegate*<byte*, float*, int, float> dotProduct)
+        {
+            int bytesPerRow = (inDim / blockSize) * bytesPerBlock;
+
+            fixed (float* pInput = input)
+            fixed (float* pOutput = output)
+            {
+                byte* w = weights;
+                float* pIn = pInput;
+                float* pOut = pOutput;
+
+                if (outDim >= ParallelRowThreshold)
+                {
+                    s_genericState.W = w;
+                    s_genericState.PIn = pIn;
+                    s_genericState.POut = pOut;
+                    s_genericState.Bpr = bytesPerRow;
+                    s_genericState.Dim = inDim;
+                    s_genericState.DotFn = dotProduct;
+                    Parallel.For(0, outDim, s_genericBody);
+                }
+                else
+                {
+                    for (int row = 0; row < outDim; row++)
+                    {
+                        byte* rowPtr = w + (long)row * bytesPerRow;
+                        pOut[row] = dotProduct(rowPtr, pIn, inDim);
                     }
                 }
             }
