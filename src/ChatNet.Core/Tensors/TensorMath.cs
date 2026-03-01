@@ -16,6 +16,11 @@ namespace ChatNet.Core.Tensors
     public static class TensorMath
     {
         /// <summary>
+        /// Minimum output rows before using Parallel.For. Below this threshold,
+        /// thread scheduling overhead exceeds the parallelism benefit.
+        /// </summary>
+        private const int ParallelRowThreshold = 512;
+        /// <summary>
         /// RMS Norm: output[i] = input[i] * weight[i] / sqrt(mean(input^2) + eps)
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -194,8 +199,9 @@ namespace ChatNet.Core.Tensors
         /// <summary>
         /// Matrix-vector multiply for Q4_0 quantized weights.
         /// weights: raw Q4_0 bytes for [outDim, inDim] matrix.
-        /// Parallelizes across output rows on multi-core machines.
+        /// Parallelizes across output rows when outDim is large enough.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public static unsafe void MatVecMulQ4_0(byte* weights, ReadOnlySpan<float> input,
             Span<float> output, int outDim, int inDim)
         {
@@ -207,22 +213,34 @@ namespace ChatNet.Core.Tensors
                 byte* w = weights;
                 float* pIn = pInput;
                 float* pOut = pOutput;
-                int bpr = bytesPerRow;
-                int dim = inDim;
 
-                Parallel.For(0, outDim, row =>
+                if (outDim >= ParallelRowThreshold)
                 {
-                    byte* rowPtr = w + (long)row * bpr;
-                    pOut[row] = DequantQ4_0.DotProduct(rowPtr, pIn, dim);
-                });
+                    int bpr = bytesPerRow;
+                    int dim = inDim;
+                    Parallel.For(0, outDim, row =>
+                    {
+                        byte* rowPtr = w + (long)row * bpr;
+                        pOut[row] = DequantQ4_0.DotProduct(rowPtr, pIn, dim);
+                    });
+                }
+                else
+                {
+                    for (int row = 0; row < outDim; row++)
+                    {
+                        byte* rowPtr = w + (long)row * bytesPerRow;
+                        pOut[row] = DequantQ4_0.DotProduct(rowPtr, pIn, inDim);
+                    }
+                }
             }
         }
 
         /// <summary>
         /// Matrix-vector multiply for Q6_K quantized weights.
         /// weights: raw Q6_K bytes for [outDim, inDim] matrix.
-        /// Parallelizes across output rows on multi-core machines.
+        /// Parallelizes across output rows when outDim is large enough.
         /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         public static unsafe void MatVecMulQ6K(byte* weights, ReadOnlySpan<float> input,
             Span<float> output, int outDim, int inDim)
         {
@@ -234,14 +252,25 @@ namespace ChatNet.Core.Tensors
                 byte* w = weights;
                 float* pIn = pInput;
                 float* pOut = pOutput;
-                int bpr = bytesPerRow;
-                int dim = inDim;
 
-                Parallel.For(0, outDim, row =>
+                if (outDim >= ParallelRowThreshold)
                 {
-                    byte* rowPtr = w + (long)row * bpr;
-                    pOut[row] = DequantQ6K.DotProduct(rowPtr, pIn, dim);
-                });
+                    int bpr = bytesPerRow;
+                    int dim = inDim;
+                    Parallel.For(0, outDim, row =>
+                    {
+                        byte* rowPtr = w + (long)row * bpr;
+                        pOut[row] = DequantQ6K.DotProduct(rowPtr, pIn, dim);
+                    });
+                }
+                else
+                {
+                    for (int row = 0; row < outDim; row++)
+                    {
+                        byte* rowPtr = w + (long)row * bytesPerRow;
+                        pOut[row] = DequantQ6K.DotProduct(rowPtr, pIn, inDim);
+                    }
+                }
             }
         }
 

@@ -100,7 +100,7 @@ namespace ChatNet.Core.Tensors.Quantization
             return DotProductScalar(quantizedRow, input, elementCount);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private static unsafe float DotProductVec128(byte* data, float* input, int elementCount)
         {
             int blockCount = elementCount / BlockSize;

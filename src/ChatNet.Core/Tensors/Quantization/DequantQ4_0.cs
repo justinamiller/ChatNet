@@ -33,13 +33,9 @@ namespace ChatNet.Core.Tensors.Quantization
 
             for (int b = 0; b < blockCount; b++)
             {
-                // Read half-float scale (2 bytes, little-endian)
                 float scale = HalfToFloat(quantizedData[srcOffset], quantizedData[srcOffset + 1]);
                 srcOffset += 2;
 
-                // Unpack 16 bytes into 32 float values using GGML nibble order:
-                //   first 16 values  from low nibbles  (qs[j] & 0x0F) - 8
-                //   next  16 values  from high nibbles (qs[j] >> 4)   - 8
                 int remaining = elementCount - dstOffset;
                 int half = remaining < 16 ? remaining : 16;
 
@@ -56,16 +52,14 @@ namespace ChatNet.Core.Tensors.Quantization
                     output[dstOffset + 16 + j] = high * scale;
                 }
 
-                srcOffset += 16; // 16 bytes of packed data per block
+                srcOffset += 16;
                 dstOffset += half + secondHalf;
             }
         }
 
         /// <summary>
         /// Fused dequant + dot product for a single Q4_0 row against a float vector.
-        /// Uses Vector128 SIMD (ARM NEON / x86 SSE) for the multiply-accumulate.
-        ///
-        /// GGML nibble order: low nibbles → positions 0..15, high nibbles → positions 16..31.
+        /// Dispatches to SIMD (Vector128 byte-level widening) or scalar fallback.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static unsafe float DotProduct(byte* quantizedRow, float* input, int elementCount)
@@ -76,14 +70,23 @@ namespace ChatNet.Core.Tensors.Quantization
             return DotProductScalar(quantizedRow, input, elementCount);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        /// <summary>
+        /// SIMD dot product using Vector128 byte-level widening.
+        /// Loads 16 packed bytes at once, extracts nibbles via SIMD AND/shift,
+        /// widens byte→ushort→uint→float, then vectorized multiply-accumulate.
+        /// Uses dual accumulators for instruction-level parallelism.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
         private static unsafe float DotProductVec128(byte* quantizedRow, float* input, int elementCount)
         {
             int blockCount = elementCount / BlockSize;
             byte* src = quantizedRow;
             float* inp = input;
 
-            var acc = Vector128<float>.Zero;
+            var acc0 = Vector128<float>.Zero;
+            var acc1 = Vector128<float>.Zero;
+            var vNibbleMask = Vector128.Create((byte)0x0F);
+            var vSub8 = Vector128.Create(8);
 
             for (int b = 0; b < blockCount; b++)
             {
@@ -91,38 +94,58 @@ namespace ChatNet.Core.Tensors.Quantization
                 src += 2;
                 var vScale = Vector128.Create(scale);
 
-                var blockAcc = Vector128<float>.Zero;
+                // Load 16 packed bytes as a single Vector128<byte>
+                var rawBytes = *(Vector128<byte>*)src;
 
-                // Low nibbles: 16 values at positions 0..15, process 4 at a time
-                for (int j = 0; j < 16; j += 4)
-                {
-                    var q = Vector128.Create(
-                        (float)((src[j] & 0xF) - 8),
-                        (float)((src[j + 1] & 0xF) - 8),
-                        (float)((src[j + 2] & 0xF) - 8),
-                        (float)((src[j + 3] & 0xF) - 8));
-                    var v = Vector128.Load(inp + j);
-                    blockAcc += q * v;
-                }
+                // Extract low nibbles: AND with 0x0F (pure vector op)
+                var loNibbles = rawBytes & vNibbleMask;
 
-                // High nibbles: 16 values at positions 16..31, process 4 at a time
-                for (int j = 0; j < 16; j += 4)
-                {
-                    var q = Vector128.Create(
-                        (float)((src[j] >> 4) - 8),
-                        (float)((src[j + 1] >> 4) - 8),
-                        (float)((src[j + 2] >> 4) - 8),
-                        (float)((src[j + 3] >> 4) - 8));
-                    var v = Vector128.Load(inp + 16 + j);
-                    blockAcc += q * v;
-                }
+                // Extract high nibbles: 16-bit shift right 4 + mask (2 vector ops)
+                var hiNibbles = Vector128.ShiftRightLogical(rawBytes.AsUInt16(), 4).AsByte() & vNibbleMask;
 
-                acc += blockAcc * vScale;
+                var blockAcc0 = Vector128<float>.Zero;
+                var blockAcc1 = Vector128<float>.Zero;
+
+                // --- Low nibbles: 16 values at input positions 0..15 ---
+                // Widen byte→ushort (2 halves of 8)
+                var loS0 = Vector128.WidenLower(loNibbles);
+                var loS1 = Vector128.WidenUpper(loNibbles);
+
+                // Widen ushort→int32, subtract 8, convert to float (4 groups of 4)
+                var lf0 = Vector128.ConvertToSingle(Vector128.WidenLower(loS0).AsInt32() - vSub8);
+                var lf1 = Vector128.ConvertToSingle(Vector128.WidenUpper(loS0).AsInt32() - vSub8);
+                var lf2 = Vector128.ConvertToSingle(Vector128.WidenLower(loS1).AsInt32() - vSub8);
+                var lf3 = Vector128.ConvertToSingle(Vector128.WidenUpper(loS1).AsInt32() - vSub8);
+
+                // Multiply-accumulate with input (dual accumulators for ILP)
+                blockAcc0 += lf0 * *(Vector128<float>*)(inp + 0);
+                blockAcc1 += lf1 * *(Vector128<float>*)(inp + 4);
+                blockAcc0 += lf2 * *(Vector128<float>*)(inp + 8);
+                blockAcc1 += lf3 * *(Vector128<float>*)(inp + 12);
+
+                // --- High nibbles: 16 values at input positions 16..31 ---
+                var hiS0 = Vector128.WidenLower(hiNibbles);
+                var hiS1 = Vector128.WidenUpper(hiNibbles);
+
+                var hf0 = Vector128.ConvertToSingle(Vector128.WidenLower(hiS0).AsInt32() - vSub8);
+                var hf1 = Vector128.ConvertToSingle(Vector128.WidenUpper(hiS0).AsInt32() - vSub8);
+                var hf2 = Vector128.ConvertToSingle(Vector128.WidenLower(hiS1).AsInt32() - vSub8);
+                var hf3 = Vector128.ConvertToSingle(Vector128.WidenUpper(hiS1).AsInt32() - vSub8);
+
+                blockAcc0 += hf0 * *(Vector128<float>*)(inp + 16);
+                blockAcc1 += hf1 * *(Vector128<float>*)(inp + 20);
+                blockAcc0 += hf2 * *(Vector128<float>*)(inp + 24);
+                blockAcc1 += hf3 * *(Vector128<float>*)(inp + 28);
+
+                // Apply per-block scale, merge into global accumulators
+                acc0 += blockAcc0 * vScale;
+                acc1 += blockAcc1 * vScale;
+
                 src += 16;
                 inp += 32;
             }
 
-            return Vector128.Sum(acc);
+            return Vector128.Sum(acc0 + acc1);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
