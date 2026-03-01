@@ -32,10 +32,11 @@ namespace ChatNet.Core.Memory
             _mmf = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
             _accessor = _mmf.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
 
-            // Get the base pointer for direct memory access
+            // Get the base pointer for direct memory access.
+            // Must add PointerOffset to reach the logical start of the view.
             byte* ptr = null;
             _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
-            _basePointer = ptr;
+            _basePointer = ptr + _accessor.PointerOffset;
         }
 
         public bool HasTensor(string tensorName)

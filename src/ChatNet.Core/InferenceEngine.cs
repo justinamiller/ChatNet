@@ -32,6 +32,9 @@ namespace ChatNet.Core
         /// <summary>Model load time in milliseconds.</summary>
         public long LoadTimeMs { get; }
 
+        /// <summary>Enable debug diagnostics to stderr.</summary>
+        public static bool DebugEnabled { get; set; }
+
         private InferenceEngine(IModel model, ITokenizer tokenizer, MemoryMappedWeights weightLoader, ModelConfig config, long loadTimeMs)
         {
             _model = model;
@@ -48,7 +51,7 @@ namespace ChatNet.Core
         {
             if (!File.Exists(modelPath))
             {
-                throw new FileNotFoundException($"Model file not found: {modelPath}");
+                throw new FileNotFoundException("Model file not found: " + modelPath);
             }
 
             var sw = Stopwatch.StartNew();
@@ -56,6 +59,13 @@ namespace ChatNet.Core
             // Step 1: Parse GGUF header and metadata
             var reader = new GgufReader(modelPath);
             reader.Load();
+
+            if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] GGUF parsed: " + reader.Tensors.Length +
+                    " tensors, dataOffset=0x" + reader.TensorDataOffset.ToString("X") +
+                    " alignment=" + reader.Alignment);
+            }
 
             // Step 2: Extract model config
             ModelConfig config = reader.ExtractModelConfig();
@@ -66,7 +76,14 @@ namespace ChatNet.Core
             // Step 4: Create tokenizer from GGUF metadata
             var tokenizer = new BpeTokenizer(reader.Metadata);
 
-            // Step 5: Create model (Llama family for now)
+            if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] Tokenizer: vocabSize=" + tokenizer.VocabSize +
+                    " bos=" + tokenizer.BosToken + " eos=" + tokenizer.EosToken);
+            }
+
+            // Step 5: Create model
+            LlamaModel.DebugEnabled = DebugEnabled;
             var weights = new LlamaWeights(weightLoader, new LlamaConfig(config));
             var model = new LlamaModel(config, weights);
 
@@ -84,7 +101,6 @@ namespace ChatNet.Core
         {
             int vocabSize = _config.VocabSize;
 
-            // Tokenize the prompt
             int[] tokenBuffer = ArrayPool<int>.Shared.Rent(_config.ContextLength);
             float[] logits = ArrayPool<float>.Shared.Rent(vocabSize);
 
@@ -92,8 +108,26 @@ namespace ChatNet.Core
             {
                 int promptTokenCount = _tokenizer.Encode(prompt.AsSpan(), tokenBuffer.AsSpan());
 
-                // Forward pass for the entire prompt (prefill)
-                ReadOnlySpan<int> promptTokens = tokenBuffer.AsSpan(0, promptTokenCount);
+                if (DebugEnabled)
+                {
+                    Console.Error.Write("[DEBUG] Encoded " + promptTokenCount + " tokens: [");
+                    int printCount = promptTokenCount < 30 ? promptTokenCount : 30;
+                    for (int di = 0; di < printCount; di++)
+                    {
+                        if (di > 0) Console.Error.Write(",");
+                        Console.Error.Write(tokenBuffer[di]);
+                    }
+                    if (promptTokenCount > 30) Console.Error.Write("...");
+                    Console.Error.WriteLine("]");
+
+                    Console.Error.Write("[DEBUG] Decoded: ");
+                    for (int di = 0; di < printCount; di++)
+                    {
+                        string decoded = _tokenizer.Decode(tokenBuffer[di]);
+                        Console.Error.Write("'" + decoded + "'");
+                    }
+                    Console.Error.WriteLine();
+                }
 
                 // Process prompt tokens one at a time (sequential for KV cache)
                 for (int i = 0; i < promptTokenCount; i++)
@@ -107,27 +141,29 @@ namespace ChatNet.Core
                 int generatedCount = 0;
                 int currentPos = promptTokenCount;
 
+                if (DebugEnabled)
+                {
+                    Console.Error.WriteLine("[DEBUG] First sampled token: " + nextToken +
+                        " ('" + _tokenizer.Decode(nextToken) + "')");
+                }
+
                 // Track recent output for stop string detection using a char buffer
                 char[] recentBuf = stopStrings != null ? new char[256] : Array.Empty<char>();
                 int recentLen = 0;
 
                 while (generatedCount < maxTokens)
                 {
-                    // Check for EOS
                     if (nextToken == _tokenizer.EosToken)
                     {
                         break;
                     }
 
-                    // Decode and emit token
                     string tokenText = _tokenizer.Decode(nextToken);
                     onToken(tokenText);
                     generatedCount++;
 
-                    // Check stop strings
                     if (stopStrings != null)
                     {
-                        // Append to ring buffer without string allocation
                         for (int ci = 0; ci < tokenText.Length; ci++)
                         {
                             if (recentLen < recentBuf.Length)
@@ -136,7 +172,6 @@ namespace ChatNet.Core
                             }
                             else
                             {
-                                // Shift left and append
                                 Array.Copy(recentBuf, 1, recentBuf, 0, recentBuf.Length - 1);
                                 recentBuf[recentBuf.Length - 1] = tokenText[ci];
                             }
@@ -155,18 +190,17 @@ namespace ChatNet.Core
                         if (shouldStop) break;
                     }
 
-                    // Check context length
                     if (currentPos >= _config.ContextLength - 1)
                     {
                         break;
                     }
 
-                    // Forward pass for this token
-                    ReadOnlySpan<int> singleToken = new ReadOnlySpan<int>(ref nextToken);
-                    _model.Forward(singleToken, currentPos, logits.AsSpan(0, vocabSize));
+                    // Forward pass for this token - reuse tokenBuffer[0] to avoid
+                    // reliance on ReadOnlySpan<int>(ref local) constructor
+                    tokenBuffer[0] = nextToken;
+                    _model.Forward(tokenBuffer.AsSpan(0, 1), currentPos, logits.AsSpan(0, vocabSize));
                     currentPos++;
 
-                    // Sample next token
                     nextToken = sampler.Sample(logits.AsSpan(0, vocabSize));
                 }
 
@@ -185,6 +219,14 @@ namespace ChatNet.Core
         public int GenerateChat(ChatSession session, ISampler sampler, int maxTokens, Action<string> onToken)
         {
             string prompt = session.BuildPrompt();
+
+            if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] Chat prompt:");
+                Console.Error.WriteLine(prompt);
+                Console.Error.WriteLine("[DEBUG] --- end prompt ---");
+            }
+
             return Generate(prompt, sampler, maxTokens, onToken, new[] { "</s>" });
         }
 

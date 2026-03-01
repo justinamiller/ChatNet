@@ -36,7 +36,13 @@ namespace ChatNet.Core.Models.Llama
         private readonly float[] _ffnOut;    // FFN down output [dim]
         private readonly float[] _attnScores; // attention scores [maxSeqLen] per head
 
+        // Reusable single-element buffer for generation (avoids ReadOnlySpan<int>(ref local) issues)
+        private readonly int[] _singleTokenBuf = new int[1];
+
         public ModelConfig Config => _modelConfig;
+
+        /// <summary>Debug flag: when true, prints diagnostic information to stderr.</summary>
+        public static bool DebugEnabled { get; set; }
 
         public LlamaModel(ModelConfig modelConfig, LlamaWeights weights)
         {
@@ -64,12 +70,24 @@ namespace ChatNet.Core.Models.Llama
             _up = new float[hiddenDim];
             _ffnOut = new float[dim];
             _attnScores = new float[maxSeq];
+
+            if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] LlamaModel constructed:");
+                Console.Error.WriteLine("[DEBUG]   dim=" + dim + " layers=" + _cfg.LayerCount +
+                    " heads=" + _cfg.HeadCount + "/" + _cfg.KvHeadCount +
+                    " headDim=" + _cfg.HeadDim + " kvDim=" + kvDim +
+                    " ffn=" + hiddenDim + " vocab=" + _cfg.VocabSize);
+                Console.Error.WriteLine("[DEBUG]   embType=" + _weights.EmbeddingType +
+                    " outType=" + _weights.OutputType);
+                Console.Error.WriteLine("[DEBUG]   attnQ[0]=" + _weights.AttnQType[0] +
+                    " attnK[0]=" + _weights.AttnKType[0] +
+                    " ffnGate[0]=" + _weights.FfnGateType[0]);
+            }
         }
 
         /// <summary>
-        /// Run forward pass for a sequence of tokens starting at the given position.
-        /// For autoregressive generation, tokenIds.Length is typically 1, with position incrementing.
-        /// Logits output is for the LAST token in the sequence.
+        /// Run forward pass for a single token at the given position.
         /// </summary>
         public void Forward(ReadOnlySpan<int> tokenIds, int position, Span<float> logits)
         {
@@ -89,8 +107,19 @@ namespace ChatNet.Core.Models.Llama
                 int tokenId = tokenIds[t];
                 int pos = position + t;
 
-                // Step 1: Token embedding - copy embedding vector to x
+                // Step 1: Token embedding
                 LoadEmbedding(tokenId, _x.AsSpan(0, dim));
+
+                if (DebugEnabled && pos == 0)
+                {
+                    float embSum = 0f;
+                    for (int ei = 0; ei < dim; ei++) embSum += _x[ei] * _x[ei];
+                    Console.Error.WriteLine("[DEBUG] Embedding[token=" + tokenId + "] L2=" +
+                        MathF.Sqrt(embSum).ToString("F6") +
+                        " first5=[" + _x[0].ToString("F4") + "," + _x[1].ToString("F4") +
+                        "," + _x[2].ToString("F4") + "," + _x[3].ToString("F4") +
+                        "," + _x[4].ToString("F4") + "]");
+                }
 
                 // Step 2: Process each transformer layer
                 for (int l = 0; l < layers; l++)
@@ -102,15 +131,12 @@ namespace ChatNet.Core.Models.Llama
                     // 2b: QKV projections
                     unsafe
                     {
-                        // Q = xNorm @ Wq  (Wq shape: [dim, dim])
                         MatVecMulByType(_weights.GetAttnQWeight(l), _weights.AttnQType[l],
                             _xNorm.AsSpan(0, dim), _q.AsSpan(0, dim), dim, dim);
 
-                        // K = xNorm @ Wk  (Wk shape: [kvDim, dim])
                         MatVecMulByType(_weights.GetAttnKWeight(l), _weights.AttnKType[l],
                             _xNorm.AsSpan(0, dim), _k.AsSpan(0, kvDim), kvDim, dim);
 
-                        // V = xNorm @ Wv  (Wv shape: [kvDim, dim])
                         MatVecMulByType(_weights.GetAttnVWeight(l), _weights.AttnVType[l],
                             _xNorm.AsSpan(0, dim), _v.AsSpan(0, kvDim), kvDim, dim);
                     }
@@ -135,7 +161,7 @@ namespace ChatNet.Core.Models.Llama
                             _attnOut.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim, dim);
                     }
 
-                    // 2g: Residual connection: x = x + attnResult
+                    // 2g: Residual connection
                     TensorMath.Add(_x.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim);
 
                     // 2h: RMS Norm before FFN
@@ -145,27 +171,31 @@ namespace ChatNet.Core.Models.Llama
                     // 2i: FFN (SiLU-gated)
                     unsafe
                     {
-                        // gate = xNorm @ W1 (gate projection) [hiddenDim, dim]
                         MatVecMulByType(_weights.GetFfnGateWeight(l), _weights.FfnGateType[l],
                             _xNorm.AsSpan(0, dim), _gate.AsSpan(0, hiddenDim), hiddenDim, dim);
 
-                        // up = xNorm @ W3 (up projection) [hiddenDim, dim]
                         MatVecMulByType(_weights.GetFfnUpWeight(l), _weights.FfnUpType[l],
                             _xNorm.AsSpan(0, dim), _up.AsSpan(0, hiddenDim), hiddenDim, dim);
                     }
 
-                    // hidden = silu(gate) * up
                     TensorMath.SiluElementwiseMul(_gate.AsSpan(0, hiddenDim), _up.AsSpan(0, hiddenDim), hiddenDim);
 
-                    // ffnOut = hidden @ W2 (down projection) [dim, hiddenDim]
                     unsafe
                     {
                         MatVecMulByType(_weights.GetFfnDownWeight(l), _weights.FfnDownType[l],
                             _gate.AsSpan(0, hiddenDim), _ffnOut.AsSpan(0, dim), dim, hiddenDim);
                     }
 
-                    // 2j: Residual connection: x = x + ffnOut
+                    // 2j: Residual connection
                     TensorMath.Add(_x.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim);
+
+                    if (DebugEnabled && pos == 0 && (l == 0 || l == layers - 1))
+                    {
+                        float xSum = 0f;
+                        for (int xi = 0; xi < dim; xi++) xSum += _x[xi] * _x[xi];
+                        Console.Error.WriteLine("[DEBUG] After layer " + l + ": x L2=" +
+                            MathF.Sqrt(xSum).ToString("F6"));
+                    }
                 }
 
                 // Step 3: Final RMS Norm
@@ -180,14 +210,32 @@ namespace ChatNet.Core.Models.Llama
                         MatVecMulByType(_weights.GetOutputWeight(), _weights.OutputType,
                             _xNorm.AsSpan(0, dim), logits, vocabSize, dim);
                     }
+
+                    if (DebugEnabled && pos <= 1)
+                    {
+                        // Print logit statistics
+                        float lMin = logits[0], lMax = logits[0], lSum = 0f;
+                        int nanCount = 0;
+                        for (int li = 0; li < vocabSize; li++)
+                        {
+                            float v = logits[li];
+                            if (float.IsNaN(v)) { nanCount++; continue; }
+                            if (v < lMin) lMin = v;
+                            if (v > lMax) lMax = v;
+                            lSum += v;
+                        }
+                        Console.Error.WriteLine("[DEBUG] Logits[pos=" + pos + "]: min=" +
+                            lMin.ToString("F4") + " max=" + lMax.ToString("F4") +
+                            " mean=" + (lSum / vocabSize).ToString("F4") +
+                            " NaN=" + nanCount +
+                            " logits[0]=" + logits[0].ToString("F4") +
+                            " logits[1]=" + logits[1].ToString("F4") +
+                            " logits[2]=" + logits[2].ToString("F4"));
+                    }
                 }
             }
         }
 
-        /// <summary>
-        /// Compute multi-head attention with grouped-query attention (GQA).
-        /// Results are written to _attnOut.
-        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ComputeAttention(int layer, int pos, int headDim, int nHeads, int nKvHeads, int kvMul, int kvDim, int dim)
         {
@@ -197,19 +245,16 @@ namespace ChatNet.Core.Models.Llama
             // Clear attention output
             _attnOut.AsSpan(0, dim).Clear();
 
-            // For each query head
             for (int h = 0; h < nHeads; h++)
             {
                 int qOffset = h * headDim;
-                int kvHead = h / kvMul; // GQA: which KV head this query head uses
+                int kvHead = h / kvMul;
                 int kvOffset = kvHead * headDim;
 
-                // Compute attention scores: Q @ K^T / sqrt(headDim) for all cached positions
                 float scale = 1.0f / MathF.Sqrt(headDim);
 
                 for (int p = 0; p <= pos; p++)
                 {
-                    // Score = dot(Q[h], K_cached[p, kvHead]) / sqrt(headDim)
                     int kCacheIdx = kvCacheLayerOffset + p * kvDim + kvOffset;
                     float score = 0f;
                     for (int d = 0; d < headDim; d++)
@@ -219,10 +264,8 @@ namespace ChatNet.Core.Models.Llama
                     _attnScores[p] = score * scale;
                 }
 
-                // Softmax over attention scores [0..pos]
                 TensorMath.Softmax(_attnScores.AsSpan(), pos + 1);
 
-                // Weighted sum of values: attnOut[h] += score[p] * V_cached[p, kvHead]
                 for (int p = 0; p <= pos; p++)
                 {
                     float attnWeight = _attnScores[p];
@@ -236,9 +279,6 @@ namespace ChatNet.Core.Models.Llama
             }
         }
 
-        /// <summary>
-        /// Load embedding vector for a token. Handles F32 and Q4_0 embeddings.
-        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void LoadEmbedding(int tokenId, Span<float> output)
         {
@@ -247,14 +287,12 @@ namespace ChatNet.Core.Models.Llama
 
             if (_weights.EmbeddingType == GgmlType.F32)
             {
-                // F32 embedding: direct copy
                 ReadOnlySpan<float> allEmb = MemoryMarshal.Cast<byte, float>(embData);
                 int offset = tokenId * dim;
                 allEmb.Slice(offset, dim).CopyTo(output);
             }
             else if (_weights.EmbeddingType == GgmlType.Q4_0)
             {
-                // Q4_0 embedding: dequantize the row for this token
                 int blocksPerRow = dim / DequantQ4_0.BlockSize;
                 int bytesPerRow = blocksPerRow * DequantQ4_0.BytesPerBlock;
                 int rowOffset = tokenId * bytesPerRow;
@@ -262,18 +300,18 @@ namespace ChatNet.Core.Models.Llama
             }
             else if (_weights.EmbeddingType == GgmlType.F16)
             {
-                // F16 embedding: convert half to float
                 int offset = tokenId * dim * 2;
                 for (int i = 0; i < dim; i++)
                 {
                     output[i] = DequantQ4_0.HalfToFloat(embData[offset + i * 2], embData[offset + i * 2 + 1]);
                 }
             }
+            else
+            {
+                throw new NotSupportedException("Unsupported embedding type: " + _weights.EmbeddingType);
+            }
         }
 
-        /// <summary>
-        /// Dispatch matrix-vector multiply based on tensor quantization type.
-        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private unsafe void MatVecMulByType(byte* weights, GgmlType type,
             ReadOnlySpan<float> input, Span<float> output, int outDim, int inDim)
@@ -289,7 +327,6 @@ namespace ChatNet.Core.Models.Llama
             }
             else if (type == GgmlType.F16)
             {
-                // Dequantize F16 on the fly - row by row
                 float[] dequantBuf = ArrayPool<float>.Shared.Rent(inDim);
                 try
                 {
@@ -313,11 +350,12 @@ namespace ChatNet.Core.Models.Llama
                     ArrayPool<float>.Shared.Return(dequantBuf);
                 }
             }
+            else
+            {
+                throw new NotSupportedException("Unsupported weight quantization type: " + type);
+            }
         }
 
-        /// <summary>
-        /// Reinterpret raw byte data as float span (for F32 norm weights).
-        /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static ReadOnlySpan<float> GetF32Weights(ReadOnlySpan<byte> data, int count)
         {

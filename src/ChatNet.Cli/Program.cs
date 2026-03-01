@@ -48,11 +48,15 @@ namespace ChatNet.Cli
             int topK = 40;
             float topP = 0.9f;
             bool interactive = false;
+            bool debug = false;
 
             for (int i = 0; i < args.Length; i++)
             {
                 switch (args[i])
                 {
+                    case "--debug":
+                        debug = true;
+                        break;
                     case "--model":
                     case "-m":
                         if (i + 1 < args.Length) modelPath = args[++i];
@@ -101,6 +105,8 @@ namespace ChatNet.Cli
             // Load model
             Console.Write("Loading model: " + modelPath + " ... ");
             Console.Out.Flush();
+
+            InferenceEngine.DebugEnabled = debug;
 
             InferenceEngine engine;
             try
