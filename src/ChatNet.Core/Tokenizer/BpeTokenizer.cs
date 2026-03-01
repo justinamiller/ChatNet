@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -24,6 +25,10 @@ namespace ChatNet.Core.Tokenizer
         private readonly string[] _specialTokenTexts;
         private readonly int[] _specialTokenIds;
         private readonly int _specialTokenCount;
+
+        // Per-token decoded string cache. Built once in ctor; Decode is O(1).
+        // Handles ▁→space replacement, byte-token decoding, and control-token suppression upfront.
+        private readonly string[] _decodeCache;
 
         // Cached single-char strings to avoid Substring(i, 1) allocations in BPE init loop.
         // Covers ASCII + SentencePiece ▁ (U+2581). Indexed by char value for chars < 128,
@@ -132,6 +137,36 @@ namespace ChatNet.Core.Tokenizer
             _specialTokenTexts = specialTexts.ToArray();
             _specialTokenIds = specialIds.ToArray();
             _specialTokenCount = _specialTokenTexts.Length;
+
+            // Build decode cache: precompute the decoded string for every token ID once.
+            // Decode() becomes a single array lookup with no per-call allocations.
+            _decodeCache = new string[tokens.Length];
+            Span<byte> byteDecodeBuffer = stackalloc byte[1];
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                string tok = tokens[i];
+
+                // Control tokens (type 3) produce no output text
+                if (tokenTypes != null && i < tokenTypes.Length && tokenTypes[i] == 3)
+                {
+                    _decodeCache[i] = "";
+                    continue;
+                }
+
+                // Byte token "<0xHH>" → the actual UTF-8 byte as a string
+                if (tok.Length == 6 && tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>')
+                {
+                    if (TryParseHexByte(tok, 3, out byte byteVal))
+                    {
+                        byteDecodeBuffer[0] = byteVal;
+                        _decodeCache[i] = Encoding.UTF8.GetString(byteDecodeBuffer);
+                        continue;
+                    }
+                }
+
+                // Replace SentencePiece ▁ with space (only allocate a new string when needed)
+                _decodeCache[i] = tok.IndexOf('\u2581') >= 0 ? tok.Replace("\u2581", " ") : tok;
+            }
         }
 
         /// <summary>
@@ -141,6 +176,8 @@ namespace ChatNet.Core.Tokenizer
         /// </summary>
         public int Encode(ReadOnlySpan<char> text, Span<int> outputTokens)
         {
+            if (outputTokens.Length == 0) return 0;
+
             if (text.Length == 0)
             {
                 outputTokens[0] = _bosToken;
@@ -150,33 +187,33 @@ namespace ChatNet.Core.Tokenizer
             int pos = 0;
             outputTokens[pos++] = _bosToken;
 
-            string fullText = text.ToString();
-
             if (_specialTokenCount == 0)
             {
-                // No special tokens to match; encode entire text with BPE
-                pos = EncodeBpeSegment(fullText, outputTokens, pos);
+                // No special tokens: encode entire text with BPE (no string allocation)
+                pos = EncodeBpeSegment(text, outputTokens, pos);
                 return pos;
             }
 
-            // Split text at special token boundaries and encode each segment
+            // Split text at special-token boundaries and BPE-encode each plain segment
             int textPos = 0;
-            while (textPos < fullText.Length)
+            int textLen = text.Length;
+
+            while (textPos < textLen)
             {
-                // Try to match a special token at this position (longest match first)
+                // Try to match a special token at current position (longest-first)
                 int matchedId = -1;
                 int matchedLen = 0;
 
                 for (int s = 0; s < _specialTokenCount; s++)
                 {
                     string specText = _specialTokenTexts[s];
-                    if (textPos + specText.Length > fullText.Length)
-                        continue;
+                    int specLen = specText.Length;
+                    if (textPos + specLen > textLen) continue;
 
                     bool match = true;
-                    for (int c = 0; c < specText.Length; c++)
+                    for (int c = 0; c < specLen; c++)
                     {
-                        if (fullText[textPos + c] != specText[c])
+                        if (text[textPos + c] != specText[c])
                         {
                             match = false;
                             break;
@@ -186,37 +223,36 @@ namespace ChatNet.Core.Tokenizer
                     if (match)
                     {
                         matchedId = _specialTokenIds[s];
-                        matchedLen = specText.Length;
-                        break; // Already sorted longest-first, so first match is best
+                        matchedLen = specLen;
+                        break; // Already sorted longest-first
                     }
                 }
 
                 if (matchedId >= 0)
                 {
-                    // Emit the special token directly
-                    outputTokens[pos++] = matchedId;
+                    if (pos < outputTokens.Length)
+                        outputTokens[pos++] = matchedId;
                     textPos += matchedLen;
                 }
                 else
                 {
-                    // Find the next special token position (or end of text)
-                    int nextSpecialPos = fullText.Length;
+                    // Find the start of the next special token (or end of text)
+                    int nextSpecialPos = textLen;
                     for (int s = 0; s < _specialTokenCount; s++)
                     {
-                        string specText = _specialTokenTexts[s];
-                        int idx = fullText.IndexOf(specText, textPos, StringComparison.Ordinal);
-                        if (idx >= 0 && idx < nextSpecialPos)
+                        int idx = text.Slice(textPos).IndexOf(_specialTokenTexts[s].AsSpan());
+                        if (idx >= 0)
                         {
-                            nextSpecialPos = idx;
+                            int absIdx = textPos + idx;
+                            if (absIdx < nextSpecialPos)
+                                nextSpecialPos = absIdx;
                         }
                     }
 
-                    // BPE encode the text segment between textPos and nextSpecialPos
-                    string segment = fullText.Substring(textPos, nextSpecialPos - textPos);
-                    if (segment.Length > 0)
-                    {
-                        pos = EncodeBpeSegment(segment, outputTokens, pos);
-                    }
+                    // BPE-encode the plain segment between textPos and nextSpecialPos
+                    if (nextSpecialPos > textPos)
+                        pos = EncodeBpeSegment(text.Slice(textPos, nextSpecialPos - textPos), outputTokens, pos);
+
                     textPos = nextSpecialPos;
                 }
             }
@@ -227,103 +263,118 @@ namespace ChatNet.Core.Tokenizer
         /// <summary>
         /// BPE encode a text segment (no special tokens).
         /// Applies SentencePiece ▁ prefix and space replacement, then iterative BPE merging.
+        /// Uses ArrayPool-rented int arrays and a doubly-linked list for O(1) merge removal.
+        /// No heap allocations except for rare non-ASCII character token lookups.
         /// </summary>
-        private int EncodeBpeSegment(string text, Span<int> outputTokens, int pos)
+        private int EncodeBpeSegment(ReadOnlySpan<char> text, Span<int> outputTokens, int pos)
         {
             if (text.Length == 0) return pos;
 
-            // SentencePiece: prepend ▁, replace spaces with ▁
-            string processed = "\u2581" + text.Replace(" ", "\u2581");
+            // Upper bound: leading ▁ + each input char can expand to at most 4 UTF-8 byte tokens.
+            // Guard against int overflow for pathologically large inputs.
+            int maxSymbols = text.Length <= (int.MaxValue / 4) - 1
+                ? (text.Length + 1) * 4
+                : int.MaxValue;
 
-            // Build initial symbol list from individual characters.
-            // Uses cached single-char strings to avoid Substring allocations for ASCII/▁.
-            var symbols = new List<string>(processed.Length);
-            int charIdx = 0;
-            while (charIdx < processed.Length)
+            int[] symIds  = ArrayPool<int>.Shared.Rent(maxSymbols);
+            int[] symNext = ArrayPool<int>.Shared.Rent(maxSymbols);
+            int[] symPrev = ArrayPool<int>.Shared.Rent(maxSymbols);
+
+            try
             {
-                char c = processed[charIdx];
-                string ch;
-                if (c < 128)
-                    ch = s_charStrings[c];
-                else if (c == '\u2581')
-                    ch = s_charStrings[128];
-                else
-                    ch = processed.Substring(charIdx, 1);
+                int symCount = 0;
+                Span<byte> utf8Buf = stackalloc byte[4];
+                Span<char> charBuf = stackalloc char[1];
 
-                if (_vocab.Contains(ch))
+                // Process: leading ▁, then each char of text (spaces become ▁)
+                for (int ci = -1; ci < text.Length; ci++)
                 {
-                    symbols.Add(ch);
-                }
-                else
-                {
-                    // Fallback to byte-level tokens
-                    byte[] charBytes = Encoding.UTF8.GetBytes(ch);
-                    for (int b = 0; b < charBytes.Length; b++)
-                    {
-                        string byteTok = "<0x" + charBytes[b].ToString("X2") + ">";
-                        symbols.Add(byteTok);
-                    }
-                }
-                charIdx++;
-            }
+                    char c = ci < 0 ? '\u2581' : (text[ci] == ' ' ? '\u2581' : text[ci]);
 
-            // BPE merge loop: repeatedly find the best merge (highest score).
-            // Uses allocation-free GetMergeTokenId to avoid string concat per candidate.
-            bool merged = true;
-            while (merged && symbols.Count > 1)
-            {
-                merged = false;
-                float bestScore = float.NegativeInfinity;
-                int bestIdx = -1;
-                int bestTokenId = -1;
+                    int tokenId;
+                    if (c < 128)
+                        tokenId = _vocab.GetTokenId(s_charStrings[(int)c]);
+                    else if (c == '\u2581')
+                        tokenId = _vocab.GetTokenId(s_charStrings[128]);
+                    else
+                        tokenId = _vocab.GetTokenId(c.ToString()); // rare non-ASCII non-▁ char
 
-                for (int i = 0; i < symbols.Count - 1; i++)
-                {
-                    int tokenId = _vocab.GetMergeTokenId(symbols[i], symbols[i + 1]);
                     if (tokenId >= 0)
                     {
-                        float score = _vocab.Scores[tokenId];
-                        if (score > bestScore)
-                        {
-                            bestScore = score;
-                            bestIdx = i;
-                            bestTokenId = tokenId;
-                        }
+                        symIds[symCount]  = tokenId;
+                        symPrev[symCount] = symCount - 1;
+                        symNext[symCount] = symCount + 1;
+                        symCount++;
                     }
-                }
-
-                if (bestIdx >= 0)
-                {
-                    symbols[bestIdx] = _vocab.Tokens[bestTokenId];
-                    symbols.RemoveAt(bestIdx + 1);
-                    merged = true;
-                }
-            }
-
-            // Convert symbols to token IDs
-            for (int i = 0; i < symbols.Count; i++)
-            {
-                int tokenId = _vocab.GetTokenId(symbols[i]);
-                if (tokenId >= 0)
-                {
-                    outputTokens[pos++] = tokenId;
-                }
-                else
-                {
-                    // Unknown token - try byte fallback
-                    byte[] tokenBytes = Encoding.UTF8.GetBytes(symbols[i]);
-                    for (int b = 0; b < tokenBytes.Length; b++)
+                    else
                     {
-                        if (_byteTokens[tokenBytes[b]] >= 0)
+                        // UTF-8 byte fallback – encode to bytes without heap allocation
+                        charBuf[0] = c;
+                        int byteLen = Encoding.UTF8.GetBytes(charBuf, utf8Buf);
+                        for (int b = 0; b < byteLen; b++)
                         {
-                            outputTokens[pos++] = _byteTokens[tokenBytes[b]];
-                        }
-                        else
-                        {
-                            outputTokens[pos++] = 0; // <unk>
+                            int byteId = _byteTokens[utf8Buf[b]];
+                            symIds[symCount]  = byteId >= 0 ? byteId : 0;
+                            symPrev[symCount] = symCount - 1;
+                            symNext[symCount] = symCount + 1;
+                            symCount++;
                         }
                     }
                 }
+
+                if (symCount == 0) return pos;
+
+                // Fix boundary nodes
+                symPrev[0] = -1;
+                symNext[symCount - 1] = -1;
+
+                // BPE merge loop: find best adjacent pair by score, merge, repeat.
+                // Linked list gives O(1) removal; ID-based merge lookup avoids string ops.
+                // All symNext values are either a valid index in [0, symCount) or -1 (sentinel),
+                // so the loop index stays within the allocated range at all times.
+                while (symCount > 1)
+                {
+                    float bestScore   = float.NegativeInfinity;
+                    int   bestIdx     = -1;
+                    int   bestMergeId = -1;
+
+                    for (int i = 0; i >= 0 && symNext[i] != -1;)
+                    {
+                        int j = symNext[i];
+                        int mergeId = _vocab.GetMergeTokenIdById(symIds[i], symIds[j]);
+                        if (mergeId >= 0)
+                        {
+                            float score = _vocab.Scores[mergeId];
+                            if (score > bestScore)
+                            {
+                                bestScore   = score;
+                                bestIdx     = i;
+                                bestMergeId = mergeId;
+                            }
+                        }
+                        i = j;
+                    }
+
+                    if (bestIdx < 0) break; // no more merges possible
+
+                    // Merge: update left slot, unlink right slot in O(1)
+                    symIds[bestIdx] = bestMergeId;
+                    int killed = symNext[bestIdx];
+                    symNext[bestIdx] = symNext[killed];
+                    if (symNext[killed] != -1)
+                        symPrev[symNext[killed]] = bestIdx;
+                    symCount--;
+                }
+
+                // Emit token IDs in linked-list order
+                for (int i = 0; i != -1 && pos < outputTokens.Length; i = symNext[i])
+                    outputTokens[pos++] = symIds[i];
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(symIds);
+                ArrayPool<int>.Shared.Return(symNext);
+                ArrayPool<int>.Shared.Return(symPrev);
             }
 
             return pos;
@@ -331,37 +382,13 @@ namespace ChatNet.Core.Tokenizer
 
         /// <summary>
         /// Decode a single token ID to its string representation.
-        /// Handles SentencePiece ▁ to space conversion and byte tokens.
+        /// Result is returned from a pre-built cache; O(1), no per-call allocations.
         /// </summary>
         public string Decode(int tokenId)
         {
-            if (tokenId < 0 || tokenId >= _vocab.Size)
-            {
+            if ((uint)tokenId >= (uint)_decodeCache.Length)
                 return "";
-            }
-
-            string token = _vocab.Tokens[tokenId];
-
-            // Skip control/special tokens in decoded output
-            if (_vocab.TokenTypes != null && tokenId < _vocab.TokenTypes.Length)
-            {
-                int ttype = _vocab.TokenTypes[tokenId];
-                if (ttype == 3) return ""; // CONTROL tokens like <s>, </s>
-            }
-
-            // Handle byte tokens: "<0xHH>" -> actual byte
-            if (token.Length == 6 && token[0] == '<' && token[1] == '0' && token[2] == 'x' && token[5] == '>')
-            {
-                if (TryParseHexByte(token, 3, out byte byteVal))
-                {
-                    Span<byte> bytes = stackalloc byte[1];
-                    bytes[0] = byteVal;
-                    return Encoding.UTF8.GetString(bytes);
-                }
-            }
-
-            // Replace SentencePiece ▁ with space
-            return token.Replace("\u2581", " ");
+            return _decodeCache[tokenId];
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -388,3 +415,4 @@ namespace ChatNet.Core.Tokenizer
         }
     }
 }
+
