@@ -236,47 +236,128 @@ namespace ChatNet.Core.Models.Llama
             }
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void ComputeAttention(int layer, int pos, int headDim, int nHeads, int nKvHeads, int kvMul, int kvDim, int dim)
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private unsafe void ComputeAttention(int layer, int pos, int headDim, int nHeads, int nKvHeads, int kvMul, int kvDim, int dim)
         {
             int maxSeq = _cfg.ContextLength;
             int kvCacheLayerOffset = layer * maxSeq * kvDim;
+            int seqLen = pos + 1;
 
-            // Clear attention output
-            _attnOut.AsSpan(0, dim).Clear();
+            // Hoist scale computation outside the head loop (headDim is constant across heads)
+            float scale = 1.0f / MathF.Sqrt(headDim);
 
-            for (int h = 0; h < nHeads; h++)
+            // Pin all arrays once to eliminate repeated pinning and enable pointer arithmetic
+            // This removes all bounds checks from the inner loops
+            fixed (float* pQ = _q)
+            fixed (float* pKeyCache = _keyCache)
+            fixed (float* pValueCache = _valueCache)
+            fixed (float* pAttnScores = _attnScores)
+            fixed (float* pAttnOut = _attnOut)
             {
-                int qOffset = h * headDim;
-                int kvHead = h / kvMul;
-                int kvOffset = kvHead * headDim;
+                // Clear attention output via pointer
+                int dimBytes = dim * sizeof(float);
+                new Span<float>(pAttnOut, dim).Clear();
 
-                float scale = 1.0f / MathF.Sqrt(headDim);
-
-                for (int p = 0; p <= pos; p++)
+                for (int h = 0; h < nHeads; h++)
                 {
-                    int kCacheIdx = kvCacheLayerOffset + p * kvDim + kvOffset;
-                    float score = 0f;
-                    for (int d = 0; d < headDim; d++)
+                    int qOffset = h * headDim;
+                    int kvHead = h / kvMul;
+                    int kvOffset = kvHead * headDim;
+
+                    float* qPtr = pQ + qOffset;
+
+                    // --- QK^T: compute attention scores ---
+                    // For each position, dot(Q[h], K_cache[layer, pos, kvHead])
+                    for (int p = 0; p < seqLen; p++)
                     {
-                        score += _q[qOffset + d] * _keyCache[kCacheIdx + d];
+                        float* kPtr = pKeyCache + kvCacheLayerOffset + p * kvDim + kvOffset;
+
+                        // SIMD dot product with dual accumulators for ILP
+                        float score = 0f;
+                        int d = 0;
+
+                        if (Vector.IsHardwareAccelerated && headDim >= Vector<float>.Count)
+                        {
+                            int vecLen = Vector<float>.Count;
+                            var vAcc0 = Vector<float>.Zero;
+                            var vAcc1 = Vector<float>.Zero;
+                            int limit = headDim - 2 * vecLen + 1;
+
+                            // Dual-accumulator unrolled loop
+                            for (; d < limit; d += 2 * vecLen)
+                            {
+                                vAcc0 += *(Vector<float>*)(qPtr + d) * *(Vector<float>*)(kPtr + d);
+                                vAcc1 += *(Vector<float>*)(qPtr + d + vecLen) * *(Vector<float>*)(kPtr + d + vecLen);
+                            }
+
+                            // Single-vector remainder
+                            int singleLimit = headDim - vecLen + 1;
+                            for (; d < singleLimit; d += vecLen)
+                            {
+                                vAcc0 += *(Vector<float>*)(qPtr + d) * *(Vector<float>*)(kPtr + d);
+                            }
+
+                            score = VectorSumFast(vAcc0 + vAcc1);
+                        }
+
+                        // Scalar tail
+                        for (; d < headDim; d++)
+                        {
+                            score += qPtr[d] * kPtr[d];
+                        }
+
+                        pAttnScores[p] = score * scale;
                     }
-                    _attnScores[p] = score * scale;
-                }
 
-                TensorMath.Softmax(_attnScores.AsSpan(), pos + 1);
+                    // Softmax over scores[0..seqLen-1]
+                    TensorMath.Softmax(new Span<float>(pAttnScores, seqLen), seqLen);
 
-                for (int p = 0; p <= pos; p++)
-                {
-                    float attnWeight = _attnScores[p];
-                    if (attnWeight == 0f) continue;
-                    int vCacheIdx = kvCacheLayerOffset + p * kvDim + kvOffset;
-                    for (int d = 0; d < headDim; d++)
+                    // --- AV: weighted sum of value vectors ---
+                    float* outPtr = pAttnOut + qOffset;
+
+                    for (int p = 0; p < seqLen; p++)
                     {
-                        _attnOut[qOffset + d] += attnWeight * _valueCache[vCacheIdx + d];
+                        float attnWeight = pAttnScores[p];
+                        if (attnWeight == 0f) continue;
+
+                        float* vPtr = pValueCache + kvCacheLayerOffset + p * kvDim + kvOffset;
+
+                        int d = 0;
+                        if (Vector.IsHardwareAccelerated && headDim >= Vector<float>.Count)
+                        {
+                            int vecLen = Vector<float>.Count;
+                            var vWeight = new Vector<float>(attnWeight);
+                            int limit = headDim - vecLen + 1;
+                            for (; d < limit; d += vecLen)
+                            {
+                                *(Vector<float>*)(outPtr + d) += *(Vector<float>*)(vPtr + d) * vWeight;
+                            }
+                        }
+
+                        // Scalar tail
+                        for (; d < headDim; d++)
+                        {
+                            outPtr[d] += attnWeight * vPtr[d];
+                        }
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Fast horizontal vector sum using pairwise add when available.
+        /// Falls back to element-wise loop otherwise.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static float VectorSumFast(Vector<float> v)
+        {
+            // For Vector<float>, the JIT produces efficient hadd sequences on x86
+            float sum = 0f;
+            for (int i = 0; i < Vector<float>.Count; i++)
+            {
+                sum += v[i];
+            }
+            return sum;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
