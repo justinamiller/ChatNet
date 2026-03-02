@@ -212,10 +212,45 @@ namespace ChatNet.Core.Models.Phi
                     }
                     else
                     {
-                        // Only ffn_up exists - treat as fused gate_up
-                        _ffnGateUpWeight[l] = w.GetTensorPointer(fuName);
-                        FfnGateUpType[l] = w.GetTensorInfo(fuName).Type;
-                        _hasFusedGateUp = true;
+                        // Only ffn_up exists - verify dimensions to determine if fused gate_up
+                        var fuInfo = w.GetTensorInfo(fuName);
+                        long actualOutDim = fuInfo.NDimensions >= 2 ? (long)fuInfo.Dimensions[1] : 0;
+                        long expectedFusedOut = (long)config.HiddenDim * 2;
+                        long expectedSeparateOut = (long)config.HiddenDim;
+
+                        if (actualOutDim == expectedFusedOut)
+                        {
+                            // Dimensions confirm fused gate_up: [dim, 2*hiddenDim]
+                            _ffnGateUpWeight[l] = w.GetTensorPointer(fuName);
+                            FfnGateUpType[l] = fuInfo.Type;
+                            _hasFusedGateUp = true;
+                        }
+                        else if (actualOutDim == expectedSeparateOut)
+                        {
+                            // Dimensions show non-fused up: [dim, hiddenDim]
+                            // This means ffn_up is a regular up projection, not fused.
+                            // Without a gate tensor, SiLU gating won't work correctly.
+                            // Treat as fused anyway but warn loudly.
+                            Console.Error.WriteLine("[WARN] PhiWeights layer " + l +
+                                ": ffn_up.weight has non-fused dims=[" +
+                                fuInfo.Dimensions[0] + "," + actualOutDim +
+                                "] (expected fused [" + config.Dim + "," + expectedFusedOut +
+                                "]). No ffn_gate tensor found either. Model output will be incorrect.");
+                            _ffnUpWeight[l] = w.GetTensorPointer(fuName);
+                            FfnUpType[l] = fuInfo.Type;
+                        }
+                        else
+                        {
+                            // Unknown dimension - treat as fused and warn
+                            Console.Error.WriteLine("[WARN] PhiWeights layer " + l +
+                                ": ffn_up.weight has unexpected dims=[" +
+                                fuInfo.Dimensions[0] + "," + actualOutDim +
+                                "] (expected fused=" + expectedFusedOut +
+                                " or separate=" + expectedSeparateOut + ")");
+                            _ffnGateUpWeight[l] = w.GetTensorPointer(fuName);
+                            FfnGateUpType[l] = fuInfo.Type;
+                            _hasFusedGateUp = true;
+                        }
                     }
                 }
             }

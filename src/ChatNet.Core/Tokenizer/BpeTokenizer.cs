@@ -193,22 +193,33 @@ namespace ChatNet.Core.Tokenizer
             _hasSpecialTokens = hasSpecial;
             _specialTokenTrie = hasSpecial ? trieRoot : null;
 
-            // Debug: log special token trie status
+            // Debug: log special token trie status with sample entries
             if (DebugEnabled && hasSpecial)
             {
                 int specialCount = 0;
+                var sampleTokens = new System.Text.StringBuilder();
+                int samplesShown = 0;
                 for (int i = 0; i < tokens.Length; i++)
                 {
                     if (tokenTypes != null && i < tokenTypes.Length)
                     {
                         int ttype = tokenTypes[i];
                         if ((ttype == 3 || ttype == 4) && tokens[i].Length > 0 && i != _bosToken)
+                        {
                             specialCount++;
+                            if (samplesShown < 15)
+                            {
+                                if (samplesShown > 0) sampleTokens.Append(", ");
+                                sampleTokens.Append(i + ":'" + tokens[i] + "'");
+                                samplesShown++;
+                            }
+                        }
                     }
                 }
                 Console.Error.WriteLine("[DEBUG] Tokenizer: " + specialCount + " special tokens in trie" +
                     " (model=" + tokenizerModel + " addBos=" + _addBosToken +
                     " isGpt2=" + _isGpt2 + ")");
+                Console.Error.WriteLine("[DEBUG] Tokenizer special tokens: " + sampleTokens.ToString());
             }
             else if (DebugEnabled)
             {

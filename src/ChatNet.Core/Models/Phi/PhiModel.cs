@@ -154,8 +154,36 @@ namespace ChatNet.Core.Models.Phi
                         }
                     }
 
+                    if (DebugEnabled && pos == 0 && l == 0)
+                    {
+                        // Print Q/K/V L2 norms after split, before RoPE
+                        float qSum = 0f, kSum = 0f, vSum = 0f;
+                        for (int qi = 0; qi < dim; qi++) qSum += _q[qi] * _q[qi];
+                        for (int ki = 0; ki < kvDim; ki++) kSum += _k[ki] * _k[ki];
+                        for (int vi = 0; vi < kvDim; vi++) vSum += _v[vi] * _v[vi];
+                        Console.Error.WriteLine("[DEBUG] PhiQKV[layer0,pos0] preRoPE: Q_L2=" +
+                            MathF.Sqrt(qSum).ToString("F4") + " K_L2=" +
+                            MathF.Sqrt(kSum).ToString("F4") + " V_L2=" +
+                            MathF.Sqrt(vSum).ToString("F4") +
+                            " Q[0..3]=[" + _q[0].ToString("F4") + "," + _q[1].ToString("F4") +
+                            "," + _q[2].ToString("F4") + "," + _q[3].ToString("F4") + "]");
+                    }
+
                     TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
                         pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase, _cfg.RotaryDim);
+
+                    if (DebugEnabled && pos == 0 && l == 0)
+                    {
+                        // Print Q/K L2 norms after RoPE to detect rotation issues
+                        float qSum = 0f, kSum = 0f;
+                        for (int qi = 0; qi < dim; qi++) qSum += _q[qi] * _q[qi];
+                        for (int ki = 0; ki < kvDim; ki++) kSum += _k[ki] * _k[ki];
+                        Console.Error.WriteLine("[DEBUG] PhiQKV[layer0,pos0] postRoPE: Q_L2=" +
+                            MathF.Sqrt(qSum).ToString("F4") + " K_L2=" +
+                            MathF.Sqrt(kSum).ToString("F4") +
+                            " Q[0..3]=[" + _q[0].ToString("F4") + "," + _q[1].ToString("F4") +
+                            "," + _q[2].ToString("F4") + "," + _q[3].ToString("F4") + "]");
+                    }
 
                     int kvCacheLayerOffset = l * _cfg.ContextLength * kvDim;
                     int kvCachePos = kvCacheLayerOffset + pos * kvDim;
@@ -196,6 +224,18 @@ namespace ChatNet.Core.Models.Phi
                             MatVecMulByType(_weights.GetFfnUpWeight(l), _weights.FfnUpType[l],
                                 _xNorm.AsSpan(0, dim), _up.AsSpan(0, hiddenDim), hiddenDim, dim);
                         }
+                    }
+
+                    if (DebugEnabled && pos == 0 && l == 0)
+                    {
+                        float gateSum = 0f, upSum = 0f;
+                        for (int gi = 0; gi < hiddenDim; gi++) gateSum += _gate[gi] * _gate[gi];
+                        for (int ui = 0; ui < hiddenDim; ui++) upSum += _up[ui] * _up[ui];
+                        Console.Error.WriteLine("[DEBUG] PhiFFN[layer0,pos0] preSiLU: gate_L2=" +
+                            MathF.Sqrt(gateSum).ToString("F4") + " up_L2=" +
+                            MathF.Sqrt(upSum).ToString("F4") +
+                            " gate[0..3]=[" + _gate[0].ToString("F4") + "," + _gate[1].ToString("F4") +
+                            "," + _gate[2].ToString("F4") + "," + _gate[3].ToString("F4") + "]");
                     }
 
                     TensorMath.SiluElementwiseMul(_gate.AsSpan(0, hiddenDim), _up.AsSpan(0, hiddenDim), hiddenDim);
