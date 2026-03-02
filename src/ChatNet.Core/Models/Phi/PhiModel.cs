@@ -47,12 +47,26 @@ namespace ChatNet.Core.Models.Phi
 
             if (DebugEnabled)
             {
+                Console.Error.WriteLine("[DEBUG] PhiModel: arch=" + _modelConfig.Architecture +
+                    " dim=" + _cfg.Dim + " hiddenDim=" + _cfg.HiddenDim +
+                    " layers=" + _cfg.LayerCount + " vocab=" + _cfg.VocabSize);
                 Console.Error.WriteLine("[DEBUG] PhiModel: fusedQKV=" + weights.HasFusedQkv +
                     " fusedGateUp=" + weights.HasFusedGateUp +
                     " rotaryDim=" + _cfg.RotaryDim + " headDim=" + _cfg.HeadDim +
-                    " kvMul=" + _cfg.KvMul);
+                    " kvMul=" + _cfg.KvMul + " ropeBase=" + _cfg.RopeFreqBase +
+                    " rmsEps=" + _cfg.RmsNormEps);
                 Console.Error.WriteLine("[DEBUG] PhiModel: embType=" + weights.EmbeddingType +
                     " outType=" + weights.OutputType);
+
+                // Warn if architecture is Phi-2 (different arch: LayerNorm, parallel residual, GELU, no gate)
+                string archLower = _modelConfig.Architecture.ToLowerInvariant();
+                if (archLower == "phi2" || archLower == "phi")
+                {
+                    Console.Error.WriteLine("[WARN] PhiModel: architecture '" + _modelConfig.Architecture +
+                        "' detected. This forward path is Phi-3 (RMSNorm, SiLU-gated FFN, sequential residual). " +
+                        "Phi-2 needs LayerNorm, GELU, parallel residual, non-gated FFN, and biases. " +
+                        "If this is a Phi-2 model, output WILL be incorrect.");
+                }
                 if (weights.HasFusedQkv)
                     Console.Error.WriteLine("[DEBUG] PhiModel: attnQkv[0]=" + weights.AttnQkvType[0]);
                 else
@@ -128,6 +142,20 @@ namespace ChatNet.Core.Models.Phi
                     ReadOnlySpan<float> attnNormW = GetF32Weights(_weights.GetAttnNormWeight(l), dim);
                     TensorMath.RmsNorm(_x.AsSpan(0, dim), attnNormW, _xNorm.AsSpan(0, dim), _cfg.RmsNormEps);
 
+                    if (DebugEnabled && pos == 0 && l == 0)
+                    {
+                        float normWL2 = 0f;
+                        for (int ni = 0; ni < dim; ni++) normWL2 += attnNormW[ni] * attnNormW[ni];
+                        float xNormL2 = 0f;
+                        for (int ni = 0; ni < dim; ni++) xNormL2 += _xNorm[ni] * _xNorm[ni];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer 0 attnNorm: normW_L2=" +
+                            MathF.Sqrt(normWL2).ToString("F4") +
+                            " xNorm_L2=" + MathF.Sqrt(xNormL2).ToString("F4") +
+                            " normW[0..4]=[" + attnNormW[0].ToString("F6") + "," +
+                            attnNormW[1].ToString("F6") + "," + attnNormW[2].ToString("F6") + "," +
+                            attnNormW[3].ToString("F6") + "," + attnNormW[4].ToString("F6") + "]");
+                    }
+
                     if (hasFusedQkv)
                     {
                         // Phi-3 fused QKV: single matmul, then split into Q, K, V
@@ -194,16 +222,54 @@ namespace ChatNet.Core.Models.Phi
 
                     ComputeAttention(l, pos, headDim, nHeads, nKvHeads, kvMul, kvDim, dim);
 
+                    if (DebugEnabled && pos == 0 && l <= 1)
+                    {
+                        float attnOutL2 = 0f;
+                        for (int ai = 0; ai < dim; ai++) attnOutL2 += _attnOut[ai] * _attnOut[ai];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer " + l + " attnOut: L2=" +
+                            MathF.Sqrt(attnOutL2).ToString("F4"));
+                    }
+
                     unsafe
                     {
                         MatVecMulByType(_weights.GetAttnOutputWeight(l), _weights.AttnOutputType[l],
                             _attnOut.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim, dim);
                     }
 
+                    if (DebugEnabled && pos == 0 && l <= 1)
+                    {
+                        float projL2 = 0f;
+                        for (int xi = 0; xi < dim; xi++) projL2 += _ffnOut[xi] * _ffnOut[xi];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer " + l + " attnProj: L2=" +
+                            MathF.Sqrt(projL2).ToString("F4"));
+                    }
+
                     TensorMath.Add(_x.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim);
+
+                    if (DebugEnabled && pos == 0 && l <= 1)
+                    {
+                        float xAfterAttn = 0f;
+                        for (int xi = 0; xi < dim; xi++) xAfterAttn += _x[xi] * _x[xi];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer " + l + " postAttnResid: x_L2=" +
+                            MathF.Sqrt(xAfterAttn).ToString("F4"));
+                    }
 
                     ReadOnlySpan<float> ffnNormW = GetF32Weights(_weights.GetFfnNormWeight(l), dim);
                     TensorMath.RmsNorm(_x.AsSpan(0, dim), ffnNormW, _xNorm.AsSpan(0, dim), _cfg.RmsNormEps);
+
+                    if (DebugEnabled && pos == 0 && l == 0)
+                    {
+                        float fnormWL2 = 0f;
+                        for (int ni = 0; ni < dim; ni++) fnormWL2 += ffnNormW[ni] * ffnNormW[ni];
+                        float xNormL2 = 0f;
+                        for (int ni = 0; ni < dim; ni++) xNormL2 += _xNorm[ni] * _xNorm[ni];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer 0 ffnNorm: normW_L2=" +
+                            MathF.Sqrt(fnormWL2).ToString("F4") +
+                            " xNorm_L2=" + MathF.Sqrt(xNormL2).ToString("F4") +
+                            " normW[0..4]=[" + ffnNormW[0].ToString("F6") + "," +
+                            ffnNormW[1].ToString("F6") + "," + ffnNormW[2].ToString("F6") + "," +
+                            ffnNormW[3].ToString("F6") + "," + ffnNormW[4].ToString("F6") + "]");
+                    }
 
                     if (hasFusedGateUp)
                     {
@@ -242,15 +308,32 @@ namespace ChatNet.Core.Models.Phi
 
                     TensorMath.SiluElementwiseMul(_gate.AsSpan(0, hiddenDim), _up.AsSpan(0, hiddenDim), hiddenDim);
 
+                    if (DebugEnabled && pos == 0 && l <= 1)
+                    {
+                        float siluL2 = 0f;
+                        for (int gi = 0; gi < hiddenDim; gi++) siluL2 += _gate[gi] * _gate[gi];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer " + l + " postSiLU: L2=" +
+                            MathF.Sqrt(siluL2).ToString("F4"));
+                    }
+
                     unsafe
                     {
                         MatVecMulByType(_weights.GetFfnDownWeight(l), _weights.FfnDownType[l],
                             _gate.AsSpan(0, hiddenDim), _ffnOut.AsSpan(0, dim), dim, hiddenDim);
                     }
 
+                    if (DebugEnabled && pos == 0 && l <= 1)
+                    {
+                        float ffnProjL2 = 0f;
+                        for (int xi = 0; xi < dim; xi++) ffnProjL2 += _ffnOut[xi] * _ffnOut[xi];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer " + l + " ffnDownProj: L2=" +
+                            MathF.Sqrt(ffnProjL2).ToString("F4"));
+                    }
+
                     TensorMath.Add(_x.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim);
 
-                    if (DebugEnabled && pos == 0 && (l == 0 || l == layers - 1))
+                    // Log x L2 after every layer (not just first and last)
+                    if (DebugEnabled && pos == 0)
                     {
                         float xSum = 0f;
                         for (int xi = 0; xi < dim; xi++) xSum += _x[xi] * _x[xi];
