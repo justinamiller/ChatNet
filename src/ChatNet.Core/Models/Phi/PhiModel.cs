@@ -51,6 +51,20 @@ namespace ChatNet.Core.Models.Phi
                     " fusedGateUp=" + weights.HasFusedGateUp +
                     " rotaryDim=" + _cfg.RotaryDim + " headDim=" + _cfg.HeadDim +
                     " kvMul=" + _cfg.KvMul);
+                Console.Error.WriteLine("[DEBUG] PhiModel: embType=" + weights.EmbeddingType +
+                    " outType=" + weights.OutputType);
+                if (weights.HasFusedQkv)
+                    Console.Error.WriteLine("[DEBUG] PhiModel: attnQkv[0]=" + weights.AttnQkvType[0]);
+                else
+                    Console.Error.WriteLine("[DEBUG] PhiModel: attnQ[0]=" + weights.AttnQType[0] +
+                        " attnK[0]=" + weights.AttnKType[0] + " attnV[0]=" + weights.AttnVType[0]);
+                Console.Error.WriteLine("[DEBUG] PhiModel: attnOut[0]=" + weights.AttnOutputType[0] +
+                    " ffnDown[0]=" + weights.FfnDownType[0]);
+                if (weights.HasFusedGateUp)
+                    Console.Error.WriteLine("[DEBUG] PhiModel: ffnGateUp[0]=" + weights.FfnGateUpType[0]);
+                else
+                    Console.Error.WriteLine("[DEBUG] PhiModel: ffnGate[0]=" + weights.FfnGateType[0] +
+                        " ffnUp[0]=" + weights.FfnUpType[0]);
             }
 
             int maxSeq = _cfg.ContextLength;
@@ -97,6 +111,17 @@ namespace ChatNet.Core.Models.Phi
                 int pos = position + t;
 
                 LoadEmbedding(tokenId, _x.AsSpan(0, dim));
+
+                if (DebugEnabled && pos == 0)
+                {
+                    float embSum = 0f;
+                    for (int ei = 0; ei < dim; ei++) embSum += _x[ei] * _x[ei];
+                    Console.Error.WriteLine("[DEBUG] PhiEmb[token=" + tokenId + "] L2=" +
+                        MathF.Sqrt(embSum).ToString("F6") +
+                        " first5=[" + _x[0].ToString("F4") + "," + _x[1].ToString("F4") +
+                        "," + _x[2].ToString("F4") + "," + _x[3].ToString("F4") +
+                        "," + _x[4].ToString("F4") + "]");
+                }
 
                 for (int l = 0; l < layers; l++)
                 {
@@ -182,6 +207,14 @@ namespace ChatNet.Core.Models.Phi
                     }
 
                     TensorMath.Add(_x.AsSpan(0, dim), _ffnOut.AsSpan(0, dim), dim);
+
+                    if (DebugEnabled && pos == 0 && (l == 0 || l == layers - 1))
+                    {
+                        float xSum = 0f;
+                        for (int xi = 0; xi < dim; xi++) xSum += _x[xi] * _x[xi];
+                        Console.Error.WriteLine("[DEBUG] PhiLayer " + l + ": x L2=" +
+                            MathF.Sqrt(xSum).ToString("F6"));
+                    }
                 }
 
                 ReadOnlySpan<float> finalNormW = GetF32Weights(_weights.GetFinalNormWeight(), dim);
@@ -193,6 +226,27 @@ namespace ChatNet.Core.Models.Phi
                     {
                         MatVecMulByType(_weights.GetOutputWeight(), _weights.OutputType,
                             _xNorm.AsSpan(0, dim), logits, vocabSize, dim);
+                    }
+
+                    if (DebugEnabled && pos <= 1)
+                    {
+                        float lMin = logits[0], lMax = logits[0], lSum = 0f;
+                        int nanCount = 0;
+                        for (int li = 0; li < vocabSize; li++)
+                        {
+                            float v = logits[li];
+                            if (float.IsNaN(v)) { nanCount++; continue; }
+                            if (v < lMin) lMin = v;
+                            if (v > lMax) lMax = v;
+                            lSum += v;
+                        }
+                        Console.Error.WriteLine("[DEBUG] PhiLogits[pos=" + pos + "]: min=" +
+                            lMin.ToString("F4") + " max=" + lMax.ToString("F4") +
+                            " mean=" + (lSum / vocabSize).ToString("F4") +
+                            " NaN=" + nanCount +
+                            " logits[0]=" + logits[0].ToString("F4") +
+                            " logits[1]=" + logits[1].ToString("F4") +
+                            " logits[2]=" + logits[2].ToString("F4"));
                     }
                 }
             }

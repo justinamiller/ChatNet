@@ -85,6 +85,8 @@ namespace ChatNet.Core.Tokenizer
             return inverse;
         }
 
+        public static bool DebugEnabled { get; set; }
+
         public int VocabSize => _vocab.Size;
         public int BosToken => _bosToken;
         public int EosToken => _eosToken;
@@ -190,6 +192,30 @@ namespace ChatNet.Core.Tokenizer
 
             _hasSpecialTokens = hasSpecial;
             _specialTokenTrie = hasSpecial ? trieRoot : null;
+
+            // Debug: log special token trie status
+            if (DebugEnabled && hasSpecial)
+            {
+                int specialCount = 0;
+                for (int i = 0; i < tokens.Length; i++)
+                {
+                    if (tokenTypes != null && i < tokenTypes.Length)
+                    {
+                        int ttype = tokenTypes[i];
+                        if ((ttype == 3 || ttype == 4) && tokens[i].Length > 0 && i != _bosToken)
+                            specialCount++;
+                    }
+                }
+                Console.Error.WriteLine("[DEBUG] Tokenizer: " + specialCount + " special tokens in trie" +
+                    " (model=" + tokenizerModel + " addBos=" + _addBosToken +
+                    " isGpt2=" + _isGpt2 + ")");
+            }
+            else if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] Tokenizer: NO special tokens found (tokenTypes " +
+                    (tokenTypes != null ? "len=" + tokenTypes.Length : "null") +
+                    " model=" + tokenizerModel + ")");
+            }
 
             // Build decode cache: pre-compute decoded string for every token (refactor item 4)
             _decodedCache = new string[_vocab.Size];

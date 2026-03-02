@@ -85,6 +85,42 @@ namespace ChatNet.Core.Models.Phi
             _ffnNormSize = new int[layers];
 
             ResolveAll(weights, config);
+
+            // Debug: verify fused tensor dimensions for first layer
+            if (_hasFusedQkv || _hasFusedGateUp)
+            {
+                int dim = config.Dim;
+                int kvDim = config.KvDim;
+                int hiddenDim = config.HiddenDim;
+
+                if (_hasFusedQkv)
+                {
+                    string qkvName = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.AttnQkvSuffix;
+                    if (weights.HasTensor(qkvName))
+                    {
+                        var info = weights.GetTensorInfo(qkvName);
+                        ulong expectedOut = (ulong)(dim + kvDim + kvDim);
+                        Console.Error.WriteLine("[DEBUG] PhiWeights: QKV tensor dims=[" +
+                            info.Dimensions[0] + "," + info.Dimensions[1] + "]" +
+                            " expected=[" + dim + "," + expectedOut + "]" +
+                            " type=" + info.Type);
+                    }
+                }
+
+                if (_hasFusedGateUp)
+                {
+                    string prefix0 = PhiTensorNames.BlockPrefix + "0";
+                    string fguName = prefix0 + PhiTensorNames.FfnGateUpSuffix;
+                    string fuName = prefix0 + PhiTensorNames.FfnUpSuffix;
+                    string tensorName = weights.HasTensor(fguName) ? fguName : fuName;
+                    var info = weights.GetTensorInfo(tensorName);
+                    ulong expectedOut = (ulong)(hiddenDim * 2);
+                    Console.Error.WriteLine("[DEBUG] PhiWeights: GateUp tensor '" + tensorName +
+                        "' dims=[" + info.Dimensions[0] + "," + info.Dimensions[1] + "]" +
+                        " expected=[" + dim + "," + expectedOut + "]" +
+                        " type=" + info.Type);
+                }
+            }
         }
 
         private void ResolveAll(MemoryMappedWeights w, PhiConfig config)

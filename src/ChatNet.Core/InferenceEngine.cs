@@ -103,6 +103,7 @@ namespace ChatNet.Core
             var weightLoader = new MemoryMappedWeights(modelPath, reader.Tensors, reader.TensorDataOffset);
 
             // Step 4: Create tokenizer from GGUF metadata
+            BpeTokenizer.DebugEnabled = DebugEnabled;
             var tokenizer = new BpeTokenizer(reader.Metadata);
 
             if (DebugEnabled)
