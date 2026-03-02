@@ -140,19 +140,31 @@ namespace ChatNet.Core.Gguf
                 : config.EmbeddingDim / config.AttentionHeadCount;
 
             // RotaryDim: partial RoPE (Phi-3 uses half of headDim)
-            // Primary: {arch}.rope.dimension_count (int, e.g. 48)
-            // Fallback: {arch}.rope.partial_rotary_factor (float, e.g. 0.5) * headDim
+            // 1. Check rope.partial_rotary_factor (float, e.g. 0.5)
+            // 2. Check rope.dimension_count if it's less than headDim
+            // 3. Phi-3 architecture fallback: always partial_rotary_factor=0.5
             int ropeDimCount = GetArchInt("rope.dimension_count", -1);
-            if (ropeDimCount > 0)
+            float partialFactor = GetArchFloat("rope.partial_rotary_factor", 0f);
+
+            if (partialFactor > 0f && partialFactor < 1f)
             {
+                // Explicit partial rotary factor
+                config.RotaryDim = (int)(config.HeadDim * partialFactor);
+            }
+            else if (ropeDimCount > 0 && ropeDimCount < config.HeadDim)
+            {
+                // Explicit rotary dimension less than headDim
                 config.RotaryDim = ropeDimCount;
+            }
+            else if (arch == "phi3")
+            {
+                // Phi-3 always uses partial_rotary_factor=0.5 but some GGUF producers
+                // store rope.dimension_count = headDim instead of the partial value
+                config.RotaryDim = config.HeadDim / 2;
             }
             else
             {
-                float partialFactor = GetArchFloat("rope.partial_rotary_factor", 0f);
-                config.RotaryDim = (partialFactor > 0f && partialFactor < 1f)
-                    ? (int)(config.HeadDim * partialFactor)
-                    : config.HeadDim;
+                config.RotaryDim = config.HeadDim;
             }
 
             // Vocab size from token array length if available, else from metadata
