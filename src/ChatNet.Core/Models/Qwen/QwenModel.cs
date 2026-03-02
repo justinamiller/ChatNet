@@ -120,7 +120,9 @@ namespace ChatNet.Core.Models.Qwen
                         }
                     }
 
-                    TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
+                    // Qwen2 GGUF uses neox-style (split-half) RoPE layout:
+                    // weights are NOT permuted for interleaved rotation.
+                    TensorMath.ApplyRoPENeox(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
                         pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase);
 
                     int kvCacheLayerOffset = l * _cfg.ContextLength * kvDim;

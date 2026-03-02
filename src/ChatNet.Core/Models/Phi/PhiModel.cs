@@ -169,7 +169,9 @@ namespace ChatNet.Core.Models.Phi
                             "," + _q[2].ToString("F4") + "," + _q[3].ToString("F4") + "]");
                     }
 
-                    TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
+                    // Phi-3 GGUF uses neox-style (split-half) RoPE layout:
+                    // weights are NOT permuted for interleaved rotation.
+                    TensorMath.ApplyRoPENeox(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
                         pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase, _cfg.RotaryDim);
 
                     if (DebugEnabled && pos == 0 && l == 0)

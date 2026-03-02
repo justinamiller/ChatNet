@@ -458,6 +458,68 @@ namespace ChatNet.Core.Tensors
         }
 
         /// <summary>
+        /// Apply Rotary Position Embedding using neox-style (split-half) layout.
+        /// Pairs element i with element i+half (where half = rotaryDim/2).
+        /// Used for models whose GGUF weights are NOT permuted for interleaved rotation
+        /// (e.g., Phi-3, Qwen2 which use LLAMA_ROPE_TYPE_NEOX in llama.cpp).
+        ///
+        /// Split-half rotation:
+        ///   q_new[i]      = q[i]      * cos(theta_i) - q[i+half] * sin(theta_i)
+        ///   q_new[i+half] = q[i+half] * cos(theta_i) + q[i]      * sin(theta_i)
+        ///
+        /// vs interleaved (ApplyRoPE):
+        ///   q_new[2i]     = q[2i]   * cos(theta_i) - q[2i+1] * sin(theta_i)
+        ///   q_new[2i+1]   = q[2i+1] * cos(theta_i) + q[2i]   * sin(theta_i)
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public static unsafe void ApplyRoPENeox(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase, int rotaryDim = 0)
+        {
+            if (rotaryDim <= 0) rotaryDim = headDim;
+            int halfDim = rotaryDim / 2;
+
+            // freq[i] = freqBase^(-2i/rotaryDim) = exp(-2i/rotaryDim * log(freqBase))
+            // theta[i] = position * freq[i]
+            float negLogBase = -MathF.Log(freqBase);
+            float dimInv = 2.0f / rotaryDim;
+
+            fixed (float* pQ = q)
+            fixed (float* pK = k)
+            {
+                for (int h = 0; h < nHeads; h++)
+                {
+                    float* vec = pQ + h * headDim;
+                    for (int i = 0; i < halfDim; i++)
+                    {
+                        float theta = position * MathF.Exp(i * dimInv * negLogBase);
+                        float cosTheta = MathF.Cos(theta);
+                        float sinTheta = MathF.Sin(theta);
+
+                        float x0 = vec[i];
+                        float x1 = vec[i + halfDim];
+                        vec[i] = x0 * cosTheta - x1 * sinTheta;
+                        vec[i + halfDim] = x1 * cosTheta + x0 * sinTheta;
+                    }
+                }
+
+                for (int h = 0; h < nKvHeads; h++)
+                {
+                    float* vec = pK + h * headDim;
+                    for (int i = 0; i < halfDim; i++)
+                    {
+                        float theta = position * MathF.Exp(i * dimInv * negLogBase);
+                        float cosTheta = MathF.Cos(theta);
+                        float sinTheta = MathF.Sin(theta);
+
+                        float x0 = vec[i];
+                        float x1 = vec[i + halfDim];
+                        vec[i] = x0 * cosTheta - x1 * sinTheta;
+                        vec[i + halfDim] = x1 * cosTheta + x0 * sinTheta;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// Matrix-vector multiply for float weights: output[i] = dot(weights[i,:], input)
         /// weights shape: [outDim, inDim], row-major.
         /// </summary>
