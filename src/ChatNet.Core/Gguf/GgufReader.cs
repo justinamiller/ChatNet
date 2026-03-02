@@ -140,9 +140,20 @@ namespace ChatNet.Core.Gguf
                 : config.EmbeddingDim / config.AttentionHeadCount;
 
             // RotaryDim: partial RoPE (Phi-3 uses half of headDim)
-            // GGUF key: {arch}.rope.dimension_count
+            // Primary: {arch}.rope.dimension_count (int, e.g. 48)
+            // Fallback: {arch}.rope.partial_rotary_factor (float, e.g. 0.5) * headDim
             int ropeDimCount = GetArchInt("rope.dimension_count", -1);
-            config.RotaryDim = ropeDimCount > 0 ? ropeDimCount : config.HeadDim;
+            if (ropeDimCount > 0)
+            {
+                config.RotaryDim = ropeDimCount;
+            }
+            else
+            {
+                float partialFactor = GetArchFloat("rope.partial_rotary_factor", 0f);
+                config.RotaryDim = (partialFactor > 0f && partialFactor < 1f)
+                    ? (int)(config.HeadDim * partialFactor)
+                    : config.HeadDim;
+            }
 
             // Vocab size from token array length if available, else from metadata
             string[]? tokens = Metadata.GetStringArray("tokenizer.ggml.tokens");

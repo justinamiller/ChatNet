@@ -45,6 +45,14 @@ namespace ChatNet.Core.Models.Phi
             _cfg = new PhiConfig(modelConfig);
             _weights = weights;
 
+            if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] PhiModel: fusedQKV=" + weights.HasFusedQkv +
+                    " fusedGateUp=" + weights.HasFusedGateUp +
+                    " rotaryDim=" + _cfg.RotaryDim + " headDim=" + _cfg.HeadDim +
+                    " kvMul=" + _cfg.KvMul);
+            }
+
             int maxSeq = _cfg.ContextLength;
             int kvDim = _cfg.KvDim;
             int dim = _cfg.Dim;
