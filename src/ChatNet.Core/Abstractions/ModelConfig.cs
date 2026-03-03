@@ -16,8 +16,13 @@ namespace ChatNet.Core.Abstractions
         public int FeedForwardDim { get; set; }
         public int ContextLength { get; set; }
         public float RopeFreqBase { get; set; } = 10000.0f;
+        public int RotaryDim { get; set; }
         public float RmsNormEpsilon { get; set; } = 1e-5f;
         public int BosTokenId { get; set; } = 1;
         public int EosTokenId { get; set; } = 2;
+
+        // Gemma 2 soft-capping parameters (0 = disabled)
+        public float AttnLogitSoftcap { get; set; }
+        public float FinalLogitSoftcap { get; set; }
     }
 }

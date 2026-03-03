@@ -6,8 +6,9 @@ namespace ChatNet.Core.Models
     public enum ModelType
     {
         Llama,
+        Qwen,
         Mistral,
-        Phi,
         Gemma,
+        Phi,
     }
 }

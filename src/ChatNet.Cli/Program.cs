@@ -5,6 +5,7 @@ using ChatNet.Core;
 using ChatNet.Core.Abstractions;
 using ChatNet.Core.Chat;
 using ChatNet.Core.Chat.Templates;
+using ChatNet.Core.Models;
 using ChatNet.Core.Samplers;
 
 namespace ChatNet.Cli
@@ -167,7 +168,7 @@ namespace ChatNet.Cli
 
         private static void RunSinglePrompt(InferenceEngine engine, ISampler sampler, string prompt, int maxTokens)
         {
-            var session = new ChatSession(new LlamaChatTemplate());
+            var session = new ChatSession(ModelFactory.CreateChatTemplate(engine.Architecture));
             session.AddUserMessage(prompt);
 
             Console.Write("> ");
@@ -200,7 +201,7 @@ namespace ChatNet.Cli
             Console.WriteLine("Interactive chat mode. Type 'exit' or 'quit' to stop. Ctrl+C to cancel generation.");
             Console.WriteLine();
 
-            var session = new ChatSession(new LlamaChatTemplate());
+            var session = new ChatSession(ModelFactory.CreateChatTemplate(engine.Architecture));
 
             while (true)
             {

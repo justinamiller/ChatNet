@@ -286,6 +286,114 @@ namespace ChatNet.Core.Tensors
         }
 
         /// <summary>
+        /// GELU activation with element-wise multiply: gate[i] = gelu(gate[i]) * up[i]
+        /// where gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        /// Used by Gemma architecture.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public static unsafe void GeluElementwiseMul(Span<float> gate, ReadOnlySpan<float> up, int length)
+        {
+            const float Sqrt2OverPi = 0.7978845608028654f;
+            const float Coeff = 0.044715f;
+
+            fixed (float* pGate = gate)
+            fixed (float* pUp = up)
+            {
+                int i = 0;
+                int limit4 = length - 3;
+                for (; i < limit4; i += 4)
+                {
+                    float x0 = pGate[i];
+                    float x1 = pGate[i + 1];
+                    float x2 = pGate[i + 2];
+                    float x3 = pGate[i + 3];
+
+                    float g0 = 0.5f * x0 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x0 + Coeff * x0 * x0 * x0)));
+                    float g1 = 0.5f * x1 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x1 + Coeff * x1 * x1 * x1)));
+                    float g2 = 0.5f * x2 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x2 + Coeff * x2 * x2 * x2)));
+                    float g3 = 0.5f * x3 * (1.0f + MathF.Tanh(Sqrt2OverPi * (x3 + Coeff * x3 * x3 * x3)));
+
+                    pGate[i] = g0 * pUp[i];
+                    pGate[i + 1] = g1 * pUp[i + 1];
+                    pGate[i + 2] = g2 * pUp[i + 2];
+                    pGate[i + 3] = g3 * pUp[i + 3];
+                }
+
+                for (; i < length; i++)
+                {
+                    float x = pGate[i];
+                    pGate[i] = (0.5f * x * (1.0f + MathF.Tanh(Sqrt2OverPi * (x + Coeff * x * x * x)))) * pUp[i];
+                }
+            }
+        }
+
+        /// <summary>
+        /// RMS Norm with weight offset: output[i] = input[i] * (weight[i] + 1.0) / sqrt(mean(input^2) + eps)
+        /// Used by Gemma architecture where norm weights are stored as delta from 1.0.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public static unsafe void RmsNormWithOffset(ReadOnlySpan<float> input, ReadOnlySpan<float> weight,
+            Span<float> output, float epsilon)
+        {
+            int n = input.Length;
+
+            fixed (float* pInput = input)
+            fixed (float* pWeight = weight)
+            fixed (float* pOutput = output)
+            {
+                float sumSq = 0f;
+                int i = 0;
+
+                if (Vector.IsHardwareAccelerated && n >= Vector<float>.Count)
+                {
+                    int vecLen = Vector<float>.Count;
+                    var vAcc0 = Vector<float>.Zero;
+                    var vAcc1 = Vector<float>.Zero;
+                    int limit2 = n - 2 * vecLen + 1;
+                    for (; i < limit2; i += 2 * vecLen)
+                    {
+                        var v0 = *(Vector<float>*)(pInput + i);
+                        var v1 = *(Vector<float>*)(pInput + i + vecLen);
+                        vAcc0 += v0 * v0;
+                        vAcc1 += v1 * v1;
+                    }
+                    int limit1 = n - vecLen + 1;
+                    for (; i < limit1; i += vecLen)
+                    {
+                        var v = *(Vector<float>*)(pInput + i);
+                        vAcc0 += v * v;
+                    }
+                    sumSq = VectorSum(vAcc0 + vAcc1);
+                }
+                for (; i < n; i++)
+                {
+                    sumSq += pInput[i] * pInput[i];
+                }
+
+                float rms = 1.0f / MathF.Sqrt(sumSq / n + epsilon);
+
+                i = 0;
+                if (Vector.IsHardwareAccelerated && n >= Vector<float>.Count)
+                {
+                    var vRms = new Vector<float>(rms);
+                    var vOne = Vector<float>.One;
+                    int vecLen = Vector<float>.Count;
+                    int limit = n - vecLen + 1;
+                    for (; i < limit; i += vecLen)
+                    {
+                        var vIn = *(Vector<float>*)(pInput + i);
+                        var vW = *(Vector<float>*)(pWeight + i) + vOne;
+                        *(Vector<float>*)(pOutput + i) = vIn * vRms * vW;
+                    }
+                }
+                for (; i < n; i++)
+                {
+                    pOutput[i] = pInput[i] * rms * (pWeight[i] + 1.0f);
+                }
+            }
+        }
+
+        /// <summary>
         /// Apply RoPE (Rotary Position Embeddings) to query and key vectors.
         ///
         /// Optimizations vs original:
@@ -297,16 +405,18 @@ namespace ChatNet.Core.Tensors
         /// - Process Q and K heads with shared frequency computation.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        public static unsafe void ApplyRoPE(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase)
+        public static unsafe void ApplyRoPE(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase, int rotaryDim = 0)
         {
-            // Precompute: freq[i] = 1.0 / pow(freqBase, i / headDim)
-            //           = exp(-i / headDim * log(freqBase))
+            // rotaryDim <= 0 means full rotation (all headDim elements)
+            // Phi-3 uses partial RoPE: rotaryDim = headDim/2
+            if (rotaryDim <= 0) rotaryDim = headDim;
+
+            // Precompute: freq[i] = 1.0 / pow(freqBase, i / rotaryDim)
+            //           = exp(-i / rotaryDim * log(freqBase))
             // theta[i]  = position * freq[i]
-            // This replaces headDim/2 calls to MathF.Pow with headDim/2 calls to
-            // MathF.Exp using a linear progression, which is the same operation
-            // Pow does internally but we avoid the log() per call.
+            // For partial RoPE (Phi-3), rotaryDim < headDim; frequency formula uses rotaryDim.
             float negLogBase = -MathF.Log(freqBase);
-            float dimInv = 1.0f / headDim;
+            float dimInv = 1.0f / rotaryDim;
 
             fixed (float* pQ = q)
             fixed (float* pK = k)
@@ -315,7 +425,7 @@ namespace ChatNet.Core.Tensors
                 for (int h = 0; h < nHeads; h++)
                 {
                     float* vec = pQ + h * headDim;
-                    for (int i = 0; i < headDim; i += 2)
+                    for (int i = 0; i < rotaryDim; i += 2)
                     {
                         float theta = position * MathF.Exp(i * dimInv * negLogBase);
                         float cosTheta = MathF.Cos(theta);
@@ -332,7 +442,7 @@ namespace ChatNet.Core.Tensors
                 for (int h = 0; h < nKvHeads; h++)
                 {
                     float* vec = pK + h * headDim;
-                    for (int i = 0; i < headDim; i += 2)
+                    for (int i = 0; i < rotaryDim; i += 2)
                     {
                         float theta = position * MathF.Exp(i * dimInv * negLogBase);
                         float cosTheta = MathF.Cos(theta);
@@ -342,6 +452,68 @@ namespace ChatNet.Core.Tensors
                         float x1 = vec[i + 1];
                         vec[i] = x0 * cosTheta - x1 * sinTheta;
                         vec[i + 1] = x0 * sinTheta + x1 * cosTheta;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Apply Rotary Position Embedding using neox-style (split-half) layout.
+        /// Pairs element i with element i+half (where half = rotaryDim/2).
+        /// Used for models whose GGUF weights are NOT permuted for interleaved rotation
+        /// (e.g., Phi-3, Qwen2 which use LLAMA_ROPE_TYPE_NEOX in llama.cpp).
+        ///
+        /// Split-half rotation:
+        ///   q_new[i]      = q[i]      * cos(theta_i) - q[i+half] * sin(theta_i)
+        ///   q_new[i+half] = q[i+half] * cos(theta_i) + q[i]      * sin(theta_i)
+        ///
+        /// vs interleaved (ApplyRoPE):
+        ///   q_new[2i]     = q[2i]   * cos(theta_i) - q[2i+1] * sin(theta_i)
+        ///   q_new[2i+1]   = q[2i+1] * cos(theta_i) + q[2i]   * sin(theta_i)
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public static unsafe void ApplyRoPENeox(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase, int rotaryDim = 0)
+        {
+            if (rotaryDim <= 0) rotaryDim = headDim;
+            int halfDim = rotaryDim / 2;
+
+            // freq[i] = freqBase^(-2i/rotaryDim) = exp(-2i/rotaryDim * log(freqBase))
+            // theta[i] = position * freq[i]
+            float negLogBase = -MathF.Log(freqBase);
+            float dimInv = 2.0f / rotaryDim;
+
+            fixed (float* pQ = q)
+            fixed (float* pK = k)
+            {
+                for (int h = 0; h < nHeads; h++)
+                {
+                    float* vec = pQ + h * headDim;
+                    for (int i = 0; i < halfDim; i++)
+                    {
+                        float theta = position * MathF.Exp(i * dimInv * negLogBase);
+                        float cosTheta = MathF.Cos(theta);
+                        float sinTheta = MathF.Sin(theta);
+
+                        float x0 = vec[i];
+                        float x1 = vec[i + halfDim];
+                        vec[i] = x0 * cosTheta - x1 * sinTheta;
+                        vec[i + halfDim] = x1 * cosTheta + x0 * sinTheta;
+                    }
+                }
+
+                for (int h = 0; h < nKvHeads; h++)
+                {
+                    float* vec = pK + h * headDim;
+                    for (int i = 0; i < halfDim; i++)
+                    {
+                        float theta = position * MathF.Exp(i * dimInv * negLogBase);
+                        float cosTheta = MathF.Cos(theta);
+                        float sinTheta = MathF.Sin(theta);
+
+                        float x0 = vec[i];
+                        float x1 = vec[i + halfDim];
+                        vec[i] = x0 * cosTheta - x1 * sinTheta;
+                        vec[i + halfDim] = x1 * cosTheta + x0 * sinTheta;
                     }
                 }
             }

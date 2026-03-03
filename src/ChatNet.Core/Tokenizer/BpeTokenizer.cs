@@ -18,6 +18,7 @@ namespace ChatNet.Core.Tokenizer
         private readonly TokenVocab _vocab;
         private readonly int _bosToken;
         private readonly int _eosToken;
+        private readonly bool _addBosToken;
 
         // Byte fallback tokens: maps byte value (0-255) -> token ID for "<0xHH>" tokens
         private readonly int[] _byteTokens;
@@ -34,6 +35,9 @@ namespace ChatNet.Core.Tokenizer
         private readonly int _spSpaceTokenId;                      // SentencePiece ▁ (U+2581) token ID
         private readonly Dictionary<char, int> _unicodeCharTokenIds; // non-ASCII single-char tokens
 
+        // Tokenizer model type: false = SentencePiece (Llama/Gemma), true = GPT-2 BPE (Qwen)
+        private readonly bool _isGpt2;
+
         // Static cache for single-char strings (used only during construction)
         private static readonly string[] s_charStrings = BuildCharStringCache();
 
@@ -46,6 +50,42 @@ namespace ChatNet.Core.Tokenizer
             cache[128] = "\u2581";
             return cache;
         }
+
+        // GPT-2 byte-level BPE: maps each byte (0-255) to a unicode char and back
+        private static readonly char[] s_gpt2ByteToChar = BuildGpt2ByteToChar();
+        private static readonly Dictionary<char, byte> s_gpt2CharToByte = BuildGpt2CharToByte();
+
+        private static char[] BuildGpt2ByteToChar()
+        {
+            // Mirrors OpenAI's bytes_to_unicode() from GPT-2
+            var map = new char[256];
+            bool[] direct = new bool[256];
+            for (int b = 33; b <= 126; b++) direct[b] = true;   // '!' .. '~'
+            for (int b = 161; b <= 172; b++) direct[b] = true;  // '¡' .. '¬'
+            for (int b = 174; b <= 255; b++) direct[b] = true;  // '®' .. 'ÿ'
+            int n = 0;
+            for (int b = 0; b < 256; b++)
+            {
+                if (direct[b])
+                    map[b] = (char)b;
+                else
+                {
+                    map[b] = (char)(256 + n);
+                    n++;
+                }
+            }
+            return map;
+        }
+
+        private static Dictionary<char, byte> BuildGpt2CharToByte()
+        {
+            var inverse = new Dictionary<char, byte>(256);
+            for (int b = 0; b < 256; b++)
+                inverse[s_gpt2ByteToChar[b]] = (byte)b;
+            return inverse;
+        }
+
+        public static bool DebugEnabled { get; set; }
 
         public int VocabSize => _vocab.Size;
         public int BosToken => _bosToken;
@@ -75,6 +115,19 @@ namespace ChatNet.Core.Tokenizer
             _vocab = new TokenVocab(tokens, scores, tokenTypes);
             _bosToken = metadata.GetInt32("tokenizer.ggml.bos_token_id", 1);
             _eosToken = metadata.GetInt32("tokenizer.ggml.eos_token_id", 2);
+
+            // Detect tokenizer model: "gpt2" = GPT-2 BPE (Qwen), "llama" = SentencePiece
+            string tokenizerModel = metadata.GetString("tokenizer.ggml.model", "llama");
+            _isGpt2 = tokenizerModel == "gpt2";
+
+            // Some models (e.g., Qwen) set add_bos_token=false - respect this flag.
+            // The value may be stored as bool, byte, or int in different GGUF producers.
+            if (metadata.TryGet<bool>("tokenizer.ggml.add_bos_token", out bool addBos))
+                _addBosToken = addBos;
+            else if (metadata.TryGet<byte>("tokenizer.ggml.add_bos_token", out byte addBosByte))
+                _addBosToken = addBosByte != 0;
+            else
+                _addBosToken = !_isGpt2; // default: SentencePiece adds BOS, GPT-2 does not
 
             // Build byte fallback mapping
             _byteTokens = new int[256];
@@ -140,6 +193,41 @@ namespace ChatNet.Core.Tokenizer
             _hasSpecialTokens = hasSpecial;
             _specialTokenTrie = hasSpecial ? trieRoot : null;
 
+            // Debug: log special token trie status with sample entries
+            if (DebugEnabled && hasSpecial)
+            {
+                int specialCount = 0;
+                var sampleTokens = new System.Text.StringBuilder();
+                int samplesShown = 0;
+                for (int i = 0; i < tokens.Length; i++)
+                {
+                    if (tokenTypes != null && i < tokenTypes.Length)
+                    {
+                        int ttype = tokenTypes[i];
+                        if ((ttype == 3 || ttype == 4) && tokens[i].Length > 0 && i != _bosToken)
+                        {
+                            specialCount++;
+                            if (samplesShown < 15)
+                            {
+                                if (samplesShown > 0) sampleTokens.Append(", ");
+                                sampleTokens.Append(i + ":'" + tokens[i] + "'");
+                                samplesShown++;
+                            }
+                        }
+                    }
+                }
+                Console.Error.WriteLine("[DEBUG] Tokenizer: " + specialCount + " special tokens in trie" +
+                    " (model=" + tokenizerModel + " addBos=" + _addBosToken +
+                    " isGpt2=" + _isGpt2 + ")");
+                Console.Error.WriteLine("[DEBUG] Tokenizer special tokens: " + sampleTokens.ToString());
+            }
+            else if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] Tokenizer: NO special tokens found (tokenTypes " +
+                    (tokenTypes != null ? "len=" + tokenTypes.Length : "null") +
+                    " model=" + tokenizerModel + ")");
+            }
+
             // Build decode cache: pre-compute decoded string for every token (refactor item 4)
             _decodedCache = new string[_vocab.Size];
             for (int i = 0; i < _vocab.Size; i++)
@@ -170,7 +258,19 @@ namespace ChatNet.Core.Tokenizer
                 }
             }
 
-            // Replace SentencePiece ▁ with space
+            // GPT-2: map each char through inverse byte table, then decode as UTF-8
+            if (_isGpt2)
+            {
+                byte[] bytes = new byte[token.Length];
+                for (int i = 0; i < token.Length; i++)
+                {
+                    if (s_gpt2CharToByte.TryGetValue(token[i], out byte b))
+                        bytes[i] = b;
+                    else
+                        bytes[i] = (byte)'?';
+                }
+                return Encoding.UTF8.GetString(bytes);
+            }
             return token.Replace("\u2581", " ");
         }
 
@@ -188,21 +288,24 @@ namespace ChatNet.Core.Tokenizer
         /// <summary>
         /// Encode text to token IDs using SentencePiece-style BPE.
         /// Uses trie-based single-pass scanning for special/control tokens (refactor item 2).
-        /// Prepends BOS token. Returns number of tokens written.
+        /// Conditionally prepends BOS token based on tokenizer.ggml.add_bos_token metadata.
+        /// Returns number of tokens written.
         /// </summary>
         public int Encode(ReadOnlySpan<char> text, Span<int> outputTokens)
         {
             // Output capacity check (refactor item 5)
             if (outputTokens.Length == 0) return 0;
 
-            if (text.Length == 0)
+            int pos = 0;
+            if (_addBosToken)
             {
-                outputTokens[0] = _bosToken;
-                return 1;
+                outputTokens[pos++] = _bosToken;
             }
 
-            int pos = 0;
-            outputTokens[pos++] = _bosToken;
+            if (text.Length == 0)
+            {
+                return pos;
+            }
 
             if (!_hasSpecialTokens)
             {
@@ -274,7 +377,8 @@ namespace ChatNet.Core.Tokenizer
         /// <summary>
         /// BPE encode a text segment (no special tokens).
         /// Uses int token IDs with linked-list structure and pooled buffers (refactor items 1, 3, 6).
-        /// Applies SentencePiece ▁ prefix and space replacement, then iterative BPE merging.
+        /// For SentencePiece: applies ▁ prefix and space replacement.
+        /// For GPT-2 BPE: uses text directly without ▁ processing.
         /// </summary>
         private int EncodeBpeSegment(ReadOnlySpan<char> text, Span<int> outputTokens, int pos)
         {
@@ -288,74 +392,136 @@ namespace ChatNet.Core.Tokenizer
             int[] symPrev = ArrayPool<int>.Shared.Rent(maxSymbols);
             int[] symNext = ArrayPool<int>.Shared.Rent(maxSymbols);
 
-            // Build processed char buffer: ▁ prefix + text with spaces replaced by ▁
-            // Encode entire buffer to UTF-8 once for byte fallback (refactor item 6)
-            int processedCharLen = 1 + text.Length;
-            char[] procChars = ArrayPool<char>.Shared.Rent(processedCharLen);
-            procChars[0] = '\u2581';
-            for (int i = 0; i < text.Length; i++)
-                procChars[i + 1] = text[i] == ' ' ? '\u2581' : text[i];
+            // Build processed char buffer:
+            // SentencePiece: ▁ prefix + text with spaces replaced by ▁
+            // GPT-2 BPE: text as-is (no ▁ prefix, no space replacement)
+            int processedCharLen;
+            char[] procChars;
+            if (_isGpt2)
+            {
+                // GPT-2 BPE: convert text to UTF-8 bytes, then map each byte to GPT-2 unicode char
+                char[] tmpChars = ArrayPool<char>.Shared.Rent(text.Length);
+                text.CopyTo(tmpChars);
+                int byteCount = Encoding.UTF8.GetByteCount(tmpChars, 0, text.Length);
+                byte[] gpt2Bytes = ArrayPool<byte>.Shared.Rent(byteCount);
+                Encoding.UTF8.GetBytes(tmpChars, 0, text.Length, gpt2Bytes, 0);
+                ArrayPool<char>.Shared.Return(tmpChars);
 
-            int utf8Len = Encoding.UTF8.GetByteCount(procChars, 0, processedCharLen);
-            byte[] utf8Buf = ArrayPool<byte>.Shared.Rent(utf8Len);
-            Encoding.UTF8.GetBytes(procChars, 0, processedCharLen, utf8Buf, 0);
+                processedCharLen = byteCount;
+                procChars = ArrayPool<char>.Shared.Rent(processedCharLen);
+                for (int i = 0; i < byteCount; i++)
+                    procChars[i] = s_gpt2ByteToChar[gpt2Bytes[i]];
+                ArrayPool<byte>.Shared.Return(gpt2Bytes);
+            }
+            else
+            {
+                processedCharLen = 1 + text.Length;
+                procChars = ArrayPool<char>.Shared.Rent(processedCharLen);
+                procChars[0] = '\u2581';
+                for (int i = 0; i < text.Length; i++)
+                    procChars[i + 1] = text[i] == ' ' ? '\u2581' : text[i];
+            }
+
+            // UTF-8 buffer only needed for SentencePiece byte fallback path
+            byte[]? utf8Buf = null;
+            if (!_isGpt2)
+            {
+                int utf8Len = Encoding.UTF8.GetByteCount(procChars, 0, processedCharLen);
+                utf8Buf = ArrayPool<byte>.Shared.Rent(utf8Len);
+                Encoding.UTF8.GetBytes(procChars, 0, processedCharLen, utf8Buf, 0);
+            }
 
             try
             {
                 int symCount = 0;
-                int byteOff = 0;
 
-                // Build initial symbol list from chars as int token IDs (refactor item 1)
-                for (int i = 0; i < processedCharLen; i++)
+                if (_isGpt2)
                 {
-                    char c = procChars[i];
-
-                    // Compute UTF-8 byte length for this char (for byte offset tracking)
-                    int charByteLen;
-                    if (c < 0x80)
-                        charByteLen = 1;
-                    else if (c < 0x800)
-                        charByteLen = 2;
-                    else if (char.IsHighSurrogate(c) && i + 1 < processedCharLen &&
-                             char.IsLowSurrogate(procChars[i + 1]))
-                        charByteLen = 4;
-                    else
-                        charByteLen = 3;
-
-                    // Look up char's token ID from pre-built caches (no string allocation)
-                    int tokenId;
-                    if (c == '\u2581')
-                        tokenId = _spSpaceTokenId;
-                    else if (c < 128)
-                        tokenId = _asciiTokenIds[c];
-                    else if (!_unicodeCharTokenIds.TryGetValue(c, out tokenId))
-                        tokenId = -1;
-
-                    if (tokenId >= 0)
+                    // GPT-2: each mapped char represents exactly one original byte
+                    for (int i = 0; i < processedCharLen; i++)
                     {
-                        // Append to linked list
-                        symIds[symCount] = tokenId;
-                        symPrev[symCount] = symCount > 0 ? symCount - 1 : -1;
-                        symNext[symCount] = -1;
-                        if (symCount > 0) symNext[symCount - 1] = symCount;
-                        symCount++;
-                    }
-                    else
-                    {
-                        // Byte fallback: emit byte tokens from pre-encoded UTF-8 buffer (refactor item 6)
-                        for (int b = 0; b < charByteLen; b++)
+                        char c = procChars[i];
+                        int tokenId;
+                        if (c < 128)
+                            tokenId = _asciiTokenIds[c];
+                        else if (!_unicodeCharTokenIds.TryGetValue(c, out tokenId))
+                            tokenId = -1;
+
+                        if (tokenId >= 0)
                         {
-                            int bt = _byteTokens[utf8Buf[byteOff + b]];
-                            symIds[symCount] = bt >= 0 ? bt : 0; // fallback to <unk>
+                            symIds[symCount] = tokenId;
+                            symPrev[symCount] = symCount > 0 ? symCount - 1 : -1;
+                            symNext[symCount] = -1;
+                            if (symCount > 0) symNext[symCount - 1] = symCount;
+                            symCount++;
+                        }
+                        else
+                        {
+                            // Byte fallback using inverse GPT-2 mapping
+                            int bt = s_gpt2CharToByte.TryGetValue(c, out byte origByte)
+                                ? _byteTokens[origByte] : -1;
+                            symIds[symCount] = bt >= 0 ? bt : 0;
                             symPrev[symCount] = symCount > 0 ? symCount - 1 : -1;
                             symNext[symCount] = -1;
                             if (symCount > 0) symNext[symCount - 1] = symCount;
                             symCount++;
                         }
                     }
+                }
+                else
+                {
+                    // SentencePiece: build symbols with ▁ handling and UTF-8 byte fallback
+                    int byteOff = 0;
+                    for (int i = 0; i < processedCharLen; i++)
+                    {
+                        char c = procChars[i];
 
-                    byteOff += charByteLen;
-                    if (charByteLen == 4) i++; // skip low surrogate of surrogate pair
+                        // Compute UTF-8 byte length for this char (for byte offset tracking)
+                        int charByteLen;
+                        if (c < 0x80)
+                            charByteLen = 1;
+                        else if (c < 0x800)
+                            charByteLen = 2;
+                        else if (char.IsHighSurrogate(c) && i + 1 < processedCharLen &&
+                                 char.IsLowSurrogate(procChars[i + 1]))
+                            charByteLen = 4;
+                        else
+                            charByteLen = 3;
+
+                        // Look up char's token ID from pre-built caches (no string allocation)
+                        int tokenId;
+                        if (c == '\u2581')
+                            tokenId = _spSpaceTokenId;
+                        else if (c < 128)
+                            tokenId = _asciiTokenIds[c];
+                        else if (!_unicodeCharTokenIds.TryGetValue(c, out tokenId))
+                            tokenId = -1;
+
+                        if (tokenId >= 0)
+                        {
+                            symIds[symCount] = tokenId;
+                            symPrev[symCount] = symCount > 0 ? symCount - 1 : -1;
+                            symNext[symCount] = -1;
+                            if (symCount > 0) symNext[symCount - 1] = symCount;
+                            symCount++;
+                        }
+                        else
+                        {
+                            // Byte fallback: emit byte tokens from pre-encoded UTF-8 buffer
+                            for (int b = 0; b < charByteLen; b++)
+                            {
+                                int bt = _byteTokens[utf8Buf![byteOff + b]];
+                                symIds[symCount] = bt >= 0 ? bt : 0;
+                                symPrev[symCount] = symCount > 0 ? symCount - 1 : -1;
+                                symNext[symCount] = -1;
+                                if (symCount > 0) symNext[symCount - 1] = symCount;
+                                symCount++;
+                            }
+                        }
+
+                        byteOff += charByteLen;
+                        if (charByteLen == 4) i++; // skip low surrogate of surrogate pair
+                    }
                 }
 
                 if (symCount == 0) return pos;
@@ -424,7 +590,8 @@ namespace ChatNet.Core.Tokenizer
                 ArrayPool<int>.Shared.Return(symPrev);
                 ArrayPool<int>.Shared.Return(symNext);
                 ArrayPool<char>.Shared.Return(procChars);
-                ArrayPool<byte>.Shared.Return(utf8Buf);
+                if (utf8Buf != null)
+                    ArrayPool<byte>.Shared.Return(utf8Buf);
             }
         }
 

@@ -7,6 +7,7 @@ using ChatNet.Core.Chat;
 using ChatNet.Core.Chat.Templates;
 using ChatNet.Core.Gguf;
 using ChatNet.Core.Memory;
+using ChatNet.Core.Models;
 using ChatNet.Core.Models.Llama;
 using ChatNet.Core.Samplers;
 using ChatNet.Core.Tokenizer;
@@ -22,6 +23,7 @@ namespace ChatNet.Core
         private readonly ITokenizer _tokenizer;
         private readonly MemoryMappedWeights _weightLoader;
         private readonly ModelConfig _config;
+        private readonly ModelType _modelType;
 
         /// <summary>Model configuration.</summary>
         public ModelConfig Config => _config;
@@ -29,18 +31,23 @@ namespace ChatNet.Core
         /// <summary>Tokenizer instance.</summary>
         public ITokenizer Tokenizer => _tokenizer;
 
+        /// <summary>Detected model architecture type.</summary>
+        public ModelType Architecture => _modelType;
+
         /// <summary>Model load time in milliseconds.</summary>
         public long LoadTimeMs { get; }
 
         /// <summary>Enable debug diagnostics to stderr.</summary>
         public static bool DebugEnabled { get; set; }
 
-        private InferenceEngine(IModel model, ITokenizer tokenizer, MemoryMappedWeights weightLoader, ModelConfig config, long loadTimeMs)
+        private InferenceEngine(IModel model, ITokenizer tokenizer, MemoryMappedWeights weightLoader,
+            ModelConfig config, ModelType modelType, long loadTimeMs)
         {
             _model = model;
             _tokenizer = tokenizer;
             _weightLoader = weightLoader;
             _config = config;
+            _modelType = modelType;
             LoadTimeMs = loadTimeMs;
         }
 
@@ -67,13 +74,36 @@ namespace ChatNet.Core
                     " alignment=" + reader.Alignment);
             }
 
-            // Step 2: Extract model config
+            // Step 2: Extract model config and detect architecture
             ModelConfig config = reader.ExtractModelConfig();
+            ModelType modelType = ModelFactory.DetectArchitecture(config.Architecture);
+
+            if (DebugEnabled)
+            {
+                Console.Error.WriteLine("[DEBUG] Detected architecture: " + modelType +
+                    " (from '" + config.Architecture + "')");
+                Console.Error.WriteLine("[DEBUG] Config: dim=" + config.EmbeddingDim +
+                    " layers=" + config.LayerCount +
+                    " heads=" + config.AttentionHeadCount +
+                    " kv_heads=" + config.KeyValueHeadCount +
+                    " headDim=" + config.HeadDim +
+                    " ffn=" + config.FeedForwardDim +
+                    " ctx=" + config.ContextLength +
+                    " vocab=" + config.VocabSize);
+                Console.Error.WriteLine("[DEBUG] RoPE freq_base=" + config.RopeFreqBase +
+                    " rotary_dim=" + config.RotaryDim +
+                    " rms_norm_eps=" + config.RmsNormEpsilon +
+                    " bos=" + config.BosTokenId + " eos=" + config.EosTokenId);
+                if (config.AttnLogitSoftcap > 0f || config.FinalLogitSoftcap > 0f)
+                    Console.Error.WriteLine("[DEBUG] Softcap: attn=" + config.AttnLogitSoftcap +
+                        " final=" + config.FinalLogitSoftcap);
+            }
 
             // Step 3: Create memory-mapped weight access
             var weightLoader = new MemoryMappedWeights(modelPath, reader.Tensors, reader.TensorDataOffset);
 
             // Step 4: Create tokenizer from GGUF metadata
+            BpeTokenizer.DebugEnabled = DebugEnabled;
             var tokenizer = new BpeTokenizer(reader.Metadata);
 
             if (DebugEnabled)
@@ -82,14 +112,86 @@ namespace ChatNet.Core
                     " bos=" + tokenizer.BosToken + " eos=" + tokenizer.EosToken);
             }
 
-            // Step 5: Create model
-            LlamaModel.DebugEnabled = DebugEnabled;
-            var weights = new LlamaWeights(weightLoader, new LlamaConfig(config));
-            var model = new LlamaModel(config, weights);
+            // Step 5: Create model via factory routing
+            IModel model = ModelFactory.CreateModel(modelType, config, weightLoader, DebugEnabled);
+
+            // Step 6: Emit tensor diagnostic summary
+            if (DebugEnabled)
+            {
+                EmitTensorDiagnostics(reader.Tensors, config, modelType);
+            }
 
             sw.Stop();
 
-            return new InferenceEngine(model, tokenizer, weightLoader, config, sw.ElapsedMilliseconds);
+            return new InferenceEngine(model, tokenizer, weightLoader, config, modelType, sw.ElapsedMilliseconds);
+        }
+
+        private static void EmitTensorDiagnostics(GgufTensorInfo[] tensors, ModelConfig config, ModelType modelType)
+        {
+            // Build a quick name set for O(1) lookup
+            var tensorNames = new System.Collections.Generic.HashSet<string>(tensors.Length);
+            for (int i = 0; i < tensors.Length; i++)
+            {
+                tensorNames.Add(tensors[i].Name);
+            }
+
+            int mapped = 0;
+            int missing = 0;
+
+            // Check critical tensors
+            string[] criticalGlobal = new[] { "token_embd.weight", "output_norm.weight" };
+            for (int i = 0; i < criticalGlobal.Length; i++)
+            {
+                if (tensorNames.Contains(criticalGlobal[i]))
+                    mapped++;
+                else
+                    missing++;
+            }
+
+            // output.weight is optional (may be tied to embeddings)
+            if (tensorNames.Contains("output.weight"))
+                mapped++;
+
+            // Check per-layer tensors
+            string[] perLayerRequired = new[]
+            {
+                ".attn_norm.weight", ".attn_output.weight",
+                ".ffn_norm.weight", ".ffn_down.weight"
+            };
+
+            for (int l = 0; l < config.LayerCount; l++)
+            {
+                string prefix = "blk." + l.ToString();
+                for (int s = 0; s < perLayerRequired.Length; s++)
+                {
+                    if (tensorNames.Contains(prefix + perLayerRequired[s]))
+                        mapped++;
+                    else
+                        missing++;
+                }
+
+                // Q/K/V can be separate or fused (attn_qkv.weight)
+                if (tensorNames.Contains(prefix + ".attn_qkv.weight"))
+                    mapped++;
+                else
+                {
+                    if (tensorNames.Contains(prefix + ".attn_q.weight")) mapped++;
+                    if (tensorNames.Contains(prefix + ".attn_k.weight")) mapped++;
+                    if (tensorNames.Contains(prefix + ".attn_v.weight")) mapped++;
+                }
+
+                // FFN gate/up can be separate or fused
+                if (tensorNames.Contains(prefix + ".ffn_gate_up.weight"))
+                    mapped++;
+                else
+                {
+                    if (tensorNames.Contains(prefix + ".ffn_gate.weight")) mapped++;
+                    if (tensorNames.Contains(prefix + ".ffn_up.weight")) mapped++;
+                }
+            }
+
+            Console.Error.WriteLine("[DEBUG] Tensor mapping for " + modelType + ": " +
+                mapped + " mapped, " + missing + " missing critical");
         }
 
         /// <summary>
@@ -214,7 +316,7 @@ namespace ChatNet.Core
         }
 
         /// <summary>
-        /// Generate a chat response using the TinyLlama chat template.
+        /// Generate a chat response using the architecture-appropriate chat template.
         /// </summary>
         public int GenerateChat(ChatSession session, ISampler sampler, int maxTokens, Action<string> onToken)
         {
@@ -227,7 +329,8 @@ namespace ChatNet.Core
                 Console.Error.WriteLine("[DEBUG] --- end prompt ---");
             }
 
-            return Generate(prompt, sampler, maxTokens, onToken, new[] { "</s>" });
+            string[] stopStrings = ModelFactory.GetStopStrings(_modelType);
+            return Generate(prompt, sampler, maxTokens, onToken, stopStrings);
         }
 
         public void Dispose()

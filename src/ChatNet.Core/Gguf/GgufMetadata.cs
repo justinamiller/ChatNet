@@ -80,6 +80,10 @@ namespace ChatNet.Core.Gguf
             {
                 if (obj is float f) return f;
                 if (obj is double d) return (float)d;
+                if (obj is uint u) return u;
+                if (obj is int i) return i;
+                if (obj is ulong ul) return ul;
+                if (obj is long l) return l;
             }
             return defaultValue;
         }

@@ -81,23 +81,91 @@ namespace ChatNet.Core.Gguf
         {
             string arch = Metadata.GetString("general.architecture", "llama");
 
+            // Helper to read int with architecture-specific key and fallback aliases
+            int GetArchInt(string suffix, int defaultValue)
+            {
+                int val = Metadata.GetInt32(arch + "." + suffix, -1);
+                if (val >= 0) return val;
+                return Metadata.GetInt32(suffix, defaultValue);
+            }
+
+            // Helper to read float with architecture-specific key, then bare key fallback.
+            // Uses TryGet to handle the case where the value is stored as int/uint.
+            float GetArchFloat(string suffix, float defaultValue)
+            {
+                string archKey = arch + "." + suffix;
+                if (Metadata.TryGet<float>(archKey, out float fv)) return fv;
+                if (Metadata.TryGet<double>(archKey, out double dv)) return (float)dv;
+                // Some quantizers store freq_base as int
+                if (Metadata.TryGet<uint>(archKey, out uint uv)) return uv;
+                if (Metadata.TryGet<int>(archKey, out int iv)) return iv;
+
+                // Fallback to bare key
+                if (Metadata.TryGet<float>(suffix, out fv)) return fv;
+                if (Metadata.TryGet<double>(suffix, out dv)) return (float)dv;
+                if (Metadata.TryGet<uint>(suffix, out uv)) return uv;
+                if (Metadata.TryGet<int>(suffix, out iv)) return iv;
+
+                return defaultValue;
+            }
+
+            int nHeads = GetArchInt("attention.head_count", 32);
+            // Default KV heads to n_heads (full MHA) if not specified.
+            // GQA models always store head_count_kv explicitly; omission implies MHA.
+            int nKvHeads = GetArchInt("attention.head_count_kv", nHeads);
+
             var config = new ModelConfig
             {
                 Architecture = arch,
                 ModelName = Metadata.GetString("general.name", "Unknown"),
-                EmbeddingDim = Metadata.GetInt32($"{arch}.embedding_length", 2048),
-                LayerCount = Metadata.GetInt32($"{arch}.block_count", 22),
-                AttentionHeadCount = Metadata.GetInt32($"{arch}.attention.head_count", 32),
-                KeyValueHeadCount = Metadata.GetInt32($"{arch}.attention.head_count_kv", 4),
-                FeedForwardDim = Metadata.GetInt32($"{arch}.feed_forward_length", 5632),
-                ContextLength = Metadata.GetInt32($"{arch}.context_length", 2048),
-                RopeFreqBase = Metadata.GetFloat32($"{arch}.rope.freq_base", 10000.0f),
-                RmsNormEpsilon = Metadata.GetFloat32($"{arch}.attention.layer_norm_rms_epsilon", 1e-5f),
+                EmbeddingDim = GetArchInt("embedding_length", 2048),
+                LayerCount = GetArchInt("block_count", 22),
+                AttentionHeadCount = nHeads,
+                KeyValueHeadCount = nKvHeads,
+                FeedForwardDim = GetArchInt("feed_forward_length", 5632),
+                ContextLength = GetArchInt("context_length", 2048),
+                RopeFreqBase = GetArchFloat("rope.freq_base", 10000.0f),
+                RmsNormEpsilon = GetArchFloat("attention.layer_norm_rms_epsilon", 1e-5f),
                 BosTokenId = Metadata.GetInt32("tokenizer.ggml.bos_token_id", 1),
                 EosTokenId = Metadata.GetInt32("tokenizer.ggml.eos_token_id", 2),
+                // Gemma 2 soft-capping
+                AttnLogitSoftcap = GetArchFloat("attn_logit_softcapping", 0f),
+                FinalLogitSoftcap = GetArchFloat("final_logit_softcapping", 0f),
             };
 
-            config.HeadDim = config.EmbeddingDim / config.AttentionHeadCount;
+            // HeadDim: prefer explicit GGUF key (Gemma 2 has head_dim != dim/n_heads)
+            int explicitHeadDim = GetArchInt("attention.key_length", -1);
+            config.HeadDim = explicitHeadDim > 0
+                ? explicitHeadDim
+                : config.EmbeddingDim / config.AttentionHeadCount;
+
+            // RotaryDim: partial RoPE (Phi-3 uses half of headDim)
+            // 1. Check rope.partial_rotary_factor (float, e.g. 0.5)
+            // 2. Check rope.dimension_count if it's less than headDim
+            // 3. Phi-3 architecture fallback: always partial_rotary_factor=0.5
+            int ropeDimCount = GetArchInt("rope.dimension_count", -1);
+            float partialFactor = GetArchFloat("rope.partial_rotary_factor", 0f);
+
+            if (partialFactor > 0f && partialFactor < 1f)
+            {
+                // Explicit partial rotary factor
+                config.RotaryDim = (int)(config.HeadDim * partialFactor);
+            }
+            else if (ropeDimCount > 0 && ropeDimCount < config.HeadDim)
+            {
+                // Explicit rotary dimension less than headDim
+                config.RotaryDim = ropeDimCount;
+            }
+            else if (arch == "phi3")
+            {
+                // Phi-3 always uses partial_rotary_factor=0.5 but some GGUF producers
+                // store rope.dimension_count = headDim instead of the partial value
+                config.RotaryDim = config.HeadDim / 2;
+            }
+            else
+            {
+                config.RotaryDim = config.HeadDim;
+            }
 
             // Vocab size from token array length if available, else from metadata
             string[]? tokens = Metadata.GetStringArray("tokenizer.ggml.tokens");
@@ -107,7 +175,7 @@ namespace ChatNet.Core.Gguf
             }
             else
             {
-                config.VocabSize = Metadata.GetInt32($"{arch}.vocab_size", 32000);
+                config.VocabSize = GetArchInt("vocab_size", 32000);
             }
 
             return config;
