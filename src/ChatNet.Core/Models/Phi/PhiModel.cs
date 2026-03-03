@@ -28,11 +28,9 @@ namespace ChatNet.Core.Models.Phi
         private readonly float[] _q;
         private readonly float[] _k;
         private readonly float[] _v;
-        private readonly float[] _qkv; // For fused QKV projections
         private readonly float[] _attnOut;
         private readonly float[] _gate;
         private readonly float[] _up;
-        private readonly float[] _gateUp; // For fused gate_up projections
         private readonly float[] _ffnOut;
         private readonly float[] _attnScores;
 
@@ -42,9 +40,6 @@ namespace ChatNet.Core.Models.Phi
         // Effective FFN hidden dimension, derived from actual tensor shapes.
         // This overrides _cfg.HiddenDim when GGUF metadata is wrong or missing.
         private readonly int _effectiveHiddenDim;
-
-        // Effective fused QKV output dimension, derived from actual tensor shapes.
-        private readonly int _effectiveQkvDim;
 
         public PhiModel(ModelConfig modelConfig, PhiWeights weights)
         {
@@ -58,23 +53,11 @@ namespace ChatNet.Core.Models.Phi
                 ? weights.ActualFfnHiddenDim
                 : _cfg.HiddenDim;
 
-            // Use tensor-derived QKV output dim when available
-            int configQkvDim = _cfg.Dim + _cfg.KvDim + _cfg.KvDim;
-            _effectiveQkvDim = (weights.HasFusedQkv && weights.ActualQkvOutDim > 0)
-                ? weights.ActualQkvOutDim
-                : configQkvDim;
-
             if (_effectiveHiddenDim != _cfg.HiddenDim)
             {
                 Console.Error.WriteLine("[WARN] PhiModel: overriding hiddenDim from " + _cfg.HiddenDim +
                     " to " + _effectiveHiddenDim + " based on ffn_down tensor dimensions." +
                     " GGUF metadata feed_forward_length is likely wrong or missing.");
-            }
-
-            if (_effectiveQkvDim != configQkvDim)
-            {
-                Console.Error.WriteLine("[WARN] PhiModel: overriding qkvDim from " + configQkvDim +
-                    " to " + _effectiveQkvDim + " based on attn_qkv tensor dimensions.");
             }
 
             if (DebugEnabled)
@@ -85,7 +68,6 @@ namespace ChatNet.Core.Models.Phi
                     " layers=" + _cfg.LayerCount + " vocab=" + _cfg.VocabSize);
                 Console.Error.WriteLine("[DEBUG] PhiModel: fusedQKV=" + weights.HasFusedQkv +
                     " fusedGateUp=" + weights.HasFusedGateUp +
-                    " qkvDim=" + _effectiveQkvDim + " (config=" + configQkvDim + ")" +
                     " rotaryDim=" + _cfg.RotaryDim + " headDim=" + _cfg.HeadDim +
                     " kvMul=" + _cfg.KvMul + " ropeBase=" + _cfg.RopeFreqBase +
                     " rmsEps=" + _cfg.RmsNormEps);
@@ -144,12 +126,9 @@ namespace ChatNet.Core.Models.Phi
             _q = new float[dim];
             _k = new float[kvDim];
             _v = new float[kvDim];
-            // Fused QKV: use tensor-derived output dimension
-            _qkv = _weights.HasFusedQkv ? new float[_effectiveQkvDim] : Array.Empty<float>();
             _attnOut = new float[dim];
             _gate = new float[hiddenDim];
             _up = new float[hiddenDim];
-            _gateUp = _weights.HasFusedGateUp ? new float[hiddenDim * 2] : Array.Empty<float>();
             _ffnOut = new float[dim];
             _attnScores = new float[maxSeq];
         }
@@ -165,9 +144,6 @@ namespace ChatNet.Core.Models.Phi
             int layers = _cfg.LayerCount;
             int hiddenDim = _effectiveHiddenDim;
             int vocabSize = _cfg.VocabSize;
-            bool hasFusedQkv = _weights.HasFusedQkv;
-            bool hasFusedGateUp = _weights.HasFusedGateUp;
-            int qkvDim = _effectiveQkvDim; // Total fused QKV output size (tensor-derived)
 
             for (int t = 0; t < tokenIds.Length; t++)
             {
@@ -206,30 +182,14 @@ namespace ChatNet.Core.Models.Phi
                             attnNormW[3].ToString("F6") + "," + attnNormW[4].ToString("F6") + "]");
                     }
 
-                    if (hasFusedQkv)
+                    unsafe
                     {
-                        // Phi-3 fused QKV: single matmul, then split into Q, K, V
-                        unsafe
-                        {
-                            MatVecMulByType(_weights.GetAttnQkvWeight(l), _weights.AttnQkvType[l],
-                                _xNorm.AsSpan(0, dim), _qkv.AsSpan(0, qkvDim), qkvDim, dim);
-                        }
-                        // Split: [0..dim) = Q, [dim..dim+kvDim) = K, [dim+kvDim..dim+2*kvDim) = V
-                        _qkv.AsSpan(0, dim).CopyTo(_q.AsSpan(0, dim));
-                        _qkv.AsSpan(dim, kvDim).CopyTo(_k.AsSpan(0, kvDim));
-                        _qkv.AsSpan(dim + kvDim, kvDim).CopyTo(_v.AsSpan(0, kvDim));
-                    }
-                    else
-                    {
-                        unsafe
-                        {
-                            MatVecMulByType(_weights.GetAttnQWeight(l), _weights.AttnQType[l],
-                                _xNorm.AsSpan(0, dim), _q.AsSpan(0, dim), dim, dim);
-                            MatVecMulByType(_weights.GetAttnKWeight(l), _weights.AttnKType[l],
-                                _xNorm.AsSpan(0, dim), _k.AsSpan(0, kvDim), kvDim, dim);
-                            MatVecMulByType(_weights.GetAttnVWeight(l), _weights.AttnVType[l],
-                                _xNorm.AsSpan(0, dim), _v.AsSpan(0, kvDim), kvDim, dim);
-                        }
+                        MatVecMulByType(_weights.GetAttnQWeight(l), _weights.AttnQType[l],
+                            _xNorm.AsSpan(0, dim), _q.AsSpan(0, dim), dim, dim);
+                        MatVecMulByType(_weights.GetAttnKWeight(l), _weights.AttnKType[l],
+                            _xNorm.AsSpan(0, dim), _k.AsSpan(0, kvDim), kvDim, dim);
+                        MatVecMulByType(_weights.GetAttnVWeight(l), _weights.AttnVType[l],
+                            _xNorm.AsSpan(0, dim), _v.AsSpan(0, kvDim), kvDim, dim);
                     }
 
                     if (DebugEnabled && pos == 0 && l == 0)
@@ -322,27 +282,12 @@ namespace ChatNet.Core.Models.Phi
                             ffnNormW[3].ToString("F6") + "," + ffnNormW[4].ToString("F6") + "]");
                     }
 
-                    if (hasFusedGateUp)
+                    unsafe
                     {
-                        // Phi-3 fused gate_up: single projection of size 2*hiddenDim, split in half
-                        unsafe
-                        {
-                            MatVecMulByType(_weights.GetFfnGateUpWeight(l), _weights.FfnGateUpType[l],
-                                _xNorm.AsSpan(0, dim), _gateUp.AsSpan(0, hiddenDim * 2), hiddenDim * 2, dim);
-                        }
-                        // Split: first half is gate, second half is up
-                        _gateUp.AsSpan(0, hiddenDim).CopyTo(_gate.AsSpan(0, hiddenDim));
-                        _gateUp.AsSpan(hiddenDim, hiddenDim).CopyTo(_up.AsSpan(0, hiddenDim));
-                    }
-                    else
-                    {
-                        unsafe
-                        {
-                            MatVecMulByType(_weights.GetFfnGateWeight(l), _weights.FfnGateType[l],
-                                _xNorm.AsSpan(0, dim), _gate.AsSpan(0, hiddenDim), hiddenDim, dim);
-                            MatVecMulByType(_weights.GetFfnUpWeight(l), _weights.FfnUpType[l],
-                                _xNorm.AsSpan(0, dim), _up.AsSpan(0, hiddenDim), hiddenDim, dim);
-                        }
+                        MatVecMulByType(_weights.GetFfnGateWeight(l), _weights.FfnGateType[l],
+                            _xNorm.AsSpan(0, dim), _gate.AsSpan(0, hiddenDim), hiddenDim, dim);
+                        MatVecMulByType(_weights.GetFfnUpWeight(l), _weights.FfnUpType[l],
+                            _xNorm.AsSpan(0, dim), _up.AsSpan(0, hiddenDim), hiddenDim, dim);
                     }
 
                     if (DebugEnabled && pos == 0 && l == 0)

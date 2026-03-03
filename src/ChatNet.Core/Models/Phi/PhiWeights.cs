@@ -98,93 +98,37 @@ namespace ChatNet.Core.Models.Phi
 
             ResolveAll(weights, config);
 
-            // Derive actual dimensions from tensor shapes (ground truth, not metadata)
-            DeriveDimensionsFromTensors(weights, config);
-        }
-
-        /// <summary>
-        /// Read actual tensor dimensions to derive the true FFN hidden dim and QKV output dim.
-        /// This ensures correctness even when GGUF metadata (feed_forward_length) is wrong or missing.
-        /// </summary>
-        private void DeriveDimensionsFromTensors(MemoryMappedWeights weights, PhiConfig config)
-        {
-            int dim = config.Dim;
-            int kvDim = config.KvDim;
-            int configHiddenDim = config.HiddenDim;
-
-            // Derive actual FFN hidden dim from ffn_down tensor's ne[0] (= intermediate_size)
-            string ffnDownName = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.FfnDownSuffix;
-            if (weights.HasTensor(ffnDownName))
+            // Debug: report dimension derivation and splitting results
             {
-                var downInfo = weights.GetTensorInfo(ffnDownName);
-                if (downInfo.NDimensions >= 2)
+                int dim = config.Dim;
+                int kvDim = config.KvDim;
+                Console.Error.WriteLine("[DEBUG] PhiWeights: actualFfnHiddenDim=" + ActualFfnHiddenDim +
+                    " configHiddenDim=" + config.HiddenDim +
+                    (ActualFfnHiddenDim != config.HiddenDim ? " MISMATCH" : " OK"));
+
+                string qkvName0 = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.AttnQkvSuffix;
+                if (weights.HasTensor(qkvName0))
                 {
-                    ActualFfnHiddenDim = (int)downInfo.Dimensions[0];
-                    if (ActualFfnHiddenDim != configHiddenDim)
-                    {
-                        Console.Error.WriteLine("[WARN] PhiWeights: config feed_forward_length=" + configHiddenDim +
-                            " but ffn_down tensor ne[0]=" + ActualFfnHiddenDim +
-                            ". GGUF metadata is WRONG. Using tensor-derived value " + ActualFfnHiddenDim + ".");
-                    }
-                }
-                else
-                {
-                    ActualFfnHiddenDim = configHiddenDim;
-                }
-            }
-            else
-            {
-                ActualFfnHiddenDim = configHiddenDim;
-            }
-
-            // Derive actual QKV output dim from fused QKV tensor's ne[1]
-            if (_hasFusedQkv)
-            {
-                string qkvName = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.AttnQkvSuffix;
-                if (weights.HasTensor(qkvName))
-                {
-                    var qkvInfo = weights.GetTensorInfo(qkvName);
-                    if (qkvInfo.NDimensions >= 2)
-                    {
-                        ActualQkvOutDim = (int)qkvInfo.Dimensions[1];
-                        int expectedQkvDim = dim + kvDim + kvDim;
-                        if (ActualQkvOutDim != expectedQkvDim)
-                        {
-                            Console.Error.WriteLine("[WARN] PhiWeights: expected QKV outDim=" + expectedQkvDim +
-                                " (dim=" + dim + " + 2*kvDim=" + (kvDim * 2) + ")" +
-                                " but tensor ne[1]=" + ActualQkvOutDim +
-                                ". Using tensor-derived value.");
-                        }
-                    }
-                }
-            }
-
-            // Debug: print derived vs config dimensions
-            Console.Error.WriteLine("[DEBUG] PhiWeights: tensorDerived hiddenDim=" + ActualFfnHiddenDim +
-                " (config=" + configHiddenDim + ")" +
-                (ActualFfnHiddenDim != configHiddenDim ? " *** MISMATCH ***" : " OK"));
-
-            if (_hasFusedQkv && ActualQkvOutDim > 0)
-            {
-                Console.Error.WriteLine("[DEBUG] PhiWeights: tensorDerived qkvOutDim=" + ActualQkvOutDim +
-                    " (expected=" + (dim + kvDim + kvDim) + ")" +
-                    " type=" + AttnQkvType[0]);
-            }
-
-            if (_hasFusedGateUp)
-            {
-                string prefix0 = PhiTensorNames.BlockPrefix + "0";
-                string fguName = prefix0 + PhiTensorNames.FfnGateUpSuffix;
-                string fuName = prefix0 + PhiTensorNames.FfnUpSuffix;
-                string tensorName = weights.HasTensor(fguName) ? fguName : fuName;
-                if (weights.HasTensor(tensorName))
-                {
-                    var info = weights.GetTensorInfo(tensorName);
-                    Console.Error.WriteLine("[DEBUG] PhiWeights: GateUp tensor '" + tensorName +
-                        "' dims=[" + info.Dimensions[0] + "," + info.Dimensions[1] + "]" +
-                        " actualHiddenDim=" + ActualFfnHiddenDim +
-                        " expected2x=" + (ActualFfnHiddenDim * 2) +
+                    var info = weights.GetTensorInfo(qkvName0);
+                    Console.Error.WriteLine("[DEBUG] PhiWeights: Split fused QKV dims=[" +
+                        info.Dimensions[0] + "," + info.Dimensions[1] + "]" +
+                        " into Q[" + dim + "], K[" + kvDim + "], V[" + kvDim + "]" +
                         " type=" + info.Type);
+                }
+
+                string fguName0 = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.FfnGateUpSuffix;
+                string fuName0 = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.FfnUpSuffix;
+                string guName0 = weights.HasTensor(fguName0) ? fguName0 : fuName0;
+                if (weights.HasTensor(guName0))
+                {
+                    var info = weights.GetTensorInfo(guName0);
+                    if ((int)info.Dimensions[1] >= ActualFfnHiddenDim * 2)
+                    {
+                        Console.Error.WriteLine("[DEBUG] PhiWeights: Split fused GateUp '" + guName0 +
+                            "' dims=[" + info.Dimensions[0] + "," + info.Dimensions[1] + "]" +
+                            " into gate[" + ActualFfnHiddenDim + "], up[" + ActualFfnHiddenDim + "]" +
+                            " type=" + info.Type);
+                    }
                 }
             }
         }
@@ -224,17 +168,27 @@ namespace ChatNet.Core.Models.Phi
                 _ffnNormWeight[l] = w.GetTensorPointer(ffnNormName);
                 _ffnNormSize[l] = (int)w.GetTensorInfo(ffnNormName).ByteSize;
 
-                // Check for fused QKV first (Phi-3 pattern)
+                // Check for fused QKV (Phi-3 pattern) — split into separate Q/K/V pointers
                 string qkvName = prefix + PhiTensorNames.AttnQkvSuffix;
                 if (w.HasTensor(qkvName))
                 {
-                    _attnQkvWeight[l] = w.GetTensorPointer(qkvName);
-                    AttnQkvType[l] = w.GetTensorInfo(qkvName).Type;
-                    _hasFusedQkv = true;
+                    var qkvInfo = w.GetTensorInfo(qkvName);
+                    GgmlType qkvType = qkvInfo.Type;
+                    byte* qkvPtr = w.GetTensorPointer(qkvName);
+                    long qkvBytesPerRow = (long)qkvInfo.ByteSize / (long)qkvInfo.Dimensions[1];
+                    int splitDim = config.Dim;
+                    int splitKvDim = config.KvDim;
+
+                    _attnQWeight[l] = qkvPtr;
+                    _attnKWeight[l] = qkvPtr + (long)splitDim * qkvBytesPerRow;
+                    _attnVWeight[l] = qkvPtr + (long)(splitDim + splitKvDim) * qkvBytesPerRow;
+                    AttnQType[l] = qkvType;
+                    AttnKType[l] = qkvType;
+                    AttnVType[l] = qkvType;
                 }
                 else
                 {
-                    // Fallback to separate Q/K/V
+                    // Separate Q/K/V tensors
                     string aqName = prefix + PhiTensorNames.AttnQSuffix;
                     _attnQWeight[l] = w.GetTensorPointer(aqName);
                     AttnQType[l] = w.GetTensorInfo(aqName).Type;
@@ -256,66 +210,50 @@ namespace ChatNet.Core.Models.Phi
                 _ffnDownWeight[l] = w.GetTensorPointer(fdName);
                 FfnDownType[l] = w.GetTensorInfo(fdName).Type;
 
-                // Check for fused gate_up pattern first
+                // Derive actual FFN hidden dim from ffn_down tensor (ne[0] = intermediate_size)
+                int actualHiddenDim = (int)w.GetTensorInfo(fdName).Dimensions[0];
+                if (l == 0) ActualFfnHiddenDim = actualHiddenDim;
+
+                // Resolve gate/up projections — split fused tensors into separate pointers
                 string fguName = prefix + PhiTensorNames.FfnGateUpSuffix;
-                if (w.HasTensor(fguName))
+                string fuName = prefix + PhiTensorNames.FfnUpSuffix;
+                string fgName = prefix + PhiTensorNames.FfnGateSuffix;
+
+                if (w.HasTensor(fgName))
                 {
-                    _ffnGateUpWeight[l] = w.GetTensorPointer(fguName);
-                    FfnGateUpType[l] = w.GetTensorInfo(fguName).Type;
-                    _hasFusedGateUp = true;
+                    // Separate gate and up tensors
+                    _ffnGateWeight[l] = w.GetTensorPointer(fgName);
+                    FfnGateType[l] = w.GetTensorInfo(fgName).Type;
+                    _ffnUpWeight[l] = w.GetTensorPointer(fuName);
+                    FfnUpType[l] = w.GetTensorInfo(fuName).Type;
                 }
                 else
                 {
-                    // Check if ffn_up is actually fused gate_up (Phi-3 sometimes stores fused as ffn_up)
-                    string fuName = prefix + PhiTensorNames.FfnUpSuffix;
-                    string fgName = prefix + PhiTensorNames.FfnGateSuffix;
-                    if (w.HasTensor(fgName))
+                    // Fused gate_up tensor — split into separate gate and up sub-pointers
+                    string guTensorName = w.HasTensor(fguName) ? fguName : fuName;
+                    var guInfo = w.GetTensorInfo(guTensorName);
+                    int guOutDim = (int)guInfo.Dimensions[1];
+                    GgmlType guType = guInfo.Type;
+                    byte* guPtr = w.GetTensorPointer(guTensorName);
+
+                    if (guOutDim >= actualHiddenDim * 2)
                     {
-                        _ffnGateWeight[l] = w.GetTensorPointer(fgName);
-                        FfnGateType[l] = w.GetTensorInfo(fgName).Type;
-                        _ffnUpWeight[l] = w.GetTensorPointer(fuName);
-                        FfnUpType[l] = w.GetTensorInfo(fuName).Type;
+                        // Fused: first half rows = gate, second half rows = up
+                        long guBytesPerRow = (long)guInfo.ByteSize / (long)guOutDim;
+                        _ffnGateWeight[l] = guPtr;
+                        _ffnUpWeight[l] = guPtr + (long)actualHiddenDim * guBytesPerRow;
+                        FfnGateType[l] = guType;
+                        FfnUpType[l] = guType;
                     }
                     else
                     {
-                        // Only ffn_up exists - verify dimensions to determine if fused gate_up
-                        var fuInfo = w.GetTensorInfo(fuName);
-                        long actualOutDim = fuInfo.NDimensions >= 2 ? (long)fuInfo.Dimensions[1] : 0;
-                        long expectedFusedOut = (long)config.HiddenDim * 2;
-                        long expectedSeparateOut = (long)config.HiddenDim;
-
-                        if (actualOutDim == expectedFusedOut)
+                        // Non-fused up tensor (no gate found)
+                        _ffnUpWeight[l] = guPtr;
+                        FfnUpType[l] = guType;
+                        if (l == 0)
                         {
-                            // Dimensions confirm fused gate_up: [dim, 2*hiddenDim]
-                            _ffnGateUpWeight[l] = w.GetTensorPointer(fuName);
-                            FfnGateUpType[l] = fuInfo.Type;
-                            _hasFusedGateUp = true;
-                        }
-                        else if (actualOutDim == expectedSeparateOut)
-                        {
-                            // Dimensions show non-fused up: [dim, hiddenDim]
-                            // This means ffn_up is a regular up projection, not fused.
-                            // Without a gate tensor, SiLU gating won't work correctly.
-                            // Treat as fused anyway but warn loudly.
-                            Console.Error.WriteLine("[WARN] PhiWeights layer " + l +
-                                ": ffn_up.weight has non-fused dims=[" +
-                                fuInfo.Dimensions[0] + "," + actualOutDim +
-                                "] (expected fused [" + config.Dim + "," + expectedFusedOut +
-                                "]). No ffn_gate tensor found either. Model output will be incorrect.");
-                            _ffnUpWeight[l] = w.GetTensorPointer(fuName);
-                            FfnUpType[l] = fuInfo.Type;
-                        }
-                        else
-                        {
-                            // Unknown dimension - treat as fused and warn
-                            Console.Error.WriteLine("[WARN] PhiWeights layer " + l +
-                                ": ffn_up.weight has unexpected dims=[" +
-                                fuInfo.Dimensions[0] + "," + actualOutDim +
-                                "] (expected fused=" + expectedFusedOut +
-                                " or separate=" + expectedSeparateOut + ")");
-                            _ffnGateUpWeight[l] = w.GetTensorPointer(fuName);
-                            FfnGateUpType[l] = fuInfo.Type;
-                            _hasFusedGateUp = true;
+                            Console.Error.WriteLine("[WARN] PhiWeights: No ffn_gate tensor and ffn_up is not fused (dims=[" +
+                                guInfo.Dimensions[0] + "," + guOutDim + "]). Model output may be incorrect.");
                         }
                     }
                 }
