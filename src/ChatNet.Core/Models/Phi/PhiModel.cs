@@ -59,7 +59,8 @@ namespace ChatNet.Core.Models.Phi
                     " outType=" + weights.OutputType);
                 bool hasShort = _cfg.RopeScalingShortFactor != null;
                 bool hasLong = _cfg.RopeScalingLongFactor != null;
-                Console.Error.WriteLine("[DEBUG] PhiModel: SuScaledRoPE=" + (hasShort || hasLong) +
+                Console.Error.WriteLine("[DEBUG] PhiModel: ropeStyle=interleaved" +
+                    " SuScaledRoPE=" + (hasShort || hasLong) +
                     " shortFactors=" + (hasShort ? _cfg.RopeScalingShortFactor!.Length + " elems" : "none") +
                     " longFactors=" + (hasLong ? _cfg.RopeScalingLongFactor!.Length + " elems" : "none") +
                     " origCtxLen=" + _cfg.OriginalContextLength);
@@ -133,17 +134,6 @@ namespace ChatNet.Core.Models.Phi
             bool hasFusedQkv = _weights.HasFusedQkv;
             bool hasFusedGateUp = _weights.HasFusedGateUp;
             int qkvDim = dim + kvDim + kvDim; // Total fused QKV output size
-
-            // SuScaled / LongRoPE: select short or long factors based on sequence length
-            float[]? ropeFactors = null;
-            if (_cfg.RopeScalingShortFactor != null || _cfg.RopeScalingLongFactor != null)
-            {
-                int maxPos = position + tokenIds.Length;
-                if (maxPos > _cfg.OriginalContextLength && _cfg.RopeScalingLongFactor != null)
-                    ropeFactors = _cfg.RopeScalingLongFactor;
-                else
-                    ropeFactors = _cfg.RopeScalingShortFactor;
-            }
 
             for (int t = 0; t < tokenIds.Length; t++)
             {
@@ -223,11 +213,11 @@ namespace ChatNet.Core.Models.Phi
                             "," + _q[2].ToString("F4") + "," + _q[3].ToString("F4") + "]");
                     }
 
-                    // Phi-3 GGUF uses neox-style (split-half) RoPE layout:
-                    // weights are NOT permuted for interleaved rotation.
-                    // SuScaled RoPE: per-dimension frequency divisors from GGUF metadata.
-                    TensorMath.ApplyRoPENeox(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
-                        pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase, _cfg.RotaryDim, ropeFactors);
+                    // Phi-3 GGUF: most converters (including llama.cpp) permute Q/K weights
+                    // for interleaved RoPE layout, same as Llama. Use ApplyRoPE (interleaved)
+                    // with partial rotation (rotaryDim = headDim/2 = 48).
+                    TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
+                        pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase, _cfg.RotaryDim);
 
                     if (DebugEnabled && pos == 0 && l == 0)
                     {
