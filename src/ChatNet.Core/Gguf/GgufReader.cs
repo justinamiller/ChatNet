@@ -167,6 +167,12 @@ namespace ChatNet.Core.Gguf
                 config.RotaryDim = config.HeadDim;
             }
 
+            // SuScaled / LongRoPE factors for Phi-3
+            // Stored as float arrays: {arch}.rope.scaling.short_factor, {arch}.rope.scaling.long_factor
+            config.RopeScalingShortFactor = Metadata.GetFloatArray(arch + ".rope.scaling.short_factor");
+            config.RopeScalingLongFactor = Metadata.GetFloatArray(arch + ".rope.scaling.long_factor");
+            config.OriginalContextLength = GetArchInt("rope.scaling.original_context_length", config.ContextLength);
+
             // Vocab size from token array length if available, else from metadata
             string[]? tokens = Metadata.GetStringArray("tokenizer.ggml.tokens");
             if (tokens != null)

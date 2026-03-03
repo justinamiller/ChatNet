@@ -24,5 +24,11 @@ namespace ChatNet.Core.Abstractions
         // Gemma 2 soft-capping parameters (0 = disabled)
         public float AttnLogitSoftcap { get; set; }
         public float FinalLogitSoftcap { get; set; }
+
+        // SuScaled / LongRoPE factors (Phi-3). Per-dimension frequency divisors.
+        // Array length = RotaryDim / 2. null = standard RoPE (no scaling).
+        public float[]? RopeScalingShortFactor { get; set; }
+        public float[]? RopeScalingLongFactor { get; set; }
+        public int OriginalContextLength { get; set; }
     }
 }

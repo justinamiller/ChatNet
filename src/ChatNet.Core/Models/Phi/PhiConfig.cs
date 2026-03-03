@@ -21,6 +21,9 @@ namespace ChatNet.Core.Models.Phi
         public float RmsNormEps { get; }
         public int KvMul { get; }
         public int RotaryDim { get; }
+        public float[]? RopeScalingShortFactor { get; }
+        public float[]? RopeScalingLongFactor { get; }
+        public int OriginalContextLength { get; }
 
         public PhiConfig(ModelConfig config)
         {
@@ -37,6 +40,9 @@ namespace ChatNet.Core.Models.Phi
             RmsNormEps = config.RmsNormEpsilon;
             KvMul = HeadCount / KvHeadCount;
             RotaryDim = config.RotaryDim;
+            RopeScalingShortFactor = config.RopeScalingShortFactor;
+            RopeScalingLongFactor = config.RopeScalingLongFactor;
+            OriginalContextLength = config.OriginalContextLength;
         }
     }
 }

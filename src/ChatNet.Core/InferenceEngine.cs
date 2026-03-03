@@ -97,6 +97,12 @@ namespace ChatNet.Core
                 if (config.AttnLogitSoftcap > 0f || config.FinalLogitSoftcap > 0f)
                     Console.Error.WriteLine("[DEBUG] Softcap: attn=" + config.AttnLogitSoftcap +
                         " final=" + config.FinalLogitSoftcap);
+                if (config.RopeScalingShortFactor != null || config.RopeScalingLongFactor != null)
+                    Console.Error.WriteLine("[DEBUG] SuScaledRoPE: shortFactors=" +
+                        (config.RopeScalingShortFactor != null ? config.RopeScalingShortFactor.Length.ToString() : "none") +
+                        " longFactors=" +
+                        (config.RopeScalingLongFactor != null ? config.RopeScalingLongFactor.Length.ToString() : "none") +
+                        " origCtxLen=" + config.OriginalContextLength);
             }
 
             // Step 3: Create memory-mapped weight access

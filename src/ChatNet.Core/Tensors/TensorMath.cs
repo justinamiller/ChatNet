@@ -472,12 +472,13 @@ namespace ChatNet.Core.Tensors
         ///   q_new[2i+1]   = q[2i+1] * cos(theta_i) + q[2i]   * sin(theta_i)
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        public static unsafe void ApplyRoPENeox(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase, int rotaryDim = 0)
+        public static unsafe void ApplyRoPENeox(Span<float> q, Span<float> k, int position, int headDim, int nHeads, int nKvHeads, float freqBase, int rotaryDim = 0, float[]? ropeFactors = null)
         {
             if (rotaryDim <= 0) rotaryDim = headDim;
             int halfDim = rotaryDim / 2;
 
             // freq[i] = freqBase^(-2i/rotaryDim) = exp(-2i/rotaryDim * log(freqBase))
+            // With SuScaled RoPE: freq[i] = freqBase^(-2i/rotaryDim) / factor[i]
             // theta[i] = position * freq[i]
             float negLogBase = -MathF.Log(freqBase);
             float dimInv = 2.0f / rotaryDim;
@@ -490,7 +491,10 @@ namespace ChatNet.Core.Tensors
                     float* vec = pQ + h * headDim;
                     for (int i = 0; i < halfDim; i++)
                     {
-                        float theta = position * MathF.Exp(i * dimInv * negLogBase);
+                        float freq = MathF.Exp(i * dimInv * negLogBase);
+                        if (ropeFactors != null)
+                            freq /= ropeFactors[i];
+                        float theta = position * freq;
                         float cosTheta = MathF.Cos(theta);
                         float sinTheta = MathF.Sin(theta);
 
@@ -506,7 +510,10 @@ namespace ChatNet.Core.Tensors
                     float* vec = pK + h * headDim;
                     for (int i = 0; i < halfDim; i++)
                     {
-                        float theta = position * MathF.Exp(i * dimInv * negLogBase);
+                        float freq = MathF.Exp(i * dimInv * negLogBase);
+                        if (ropeFactors != null)
+                            freq /= ropeFactors[i];
+                        float theta = position * freq;
                         float cosTheta = MathF.Cos(theta);
                         float sinTheta = MathF.Sin(theta);
 
