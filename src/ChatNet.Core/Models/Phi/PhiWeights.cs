@@ -55,6 +55,18 @@ namespace ChatNet.Core.Models.Phi
         public bool HasFusedQkv => _hasFusedQkv;
         public bool HasFusedGateUp => _hasFusedGateUp;
 
+        /// <summary>
+        /// Actual FFN intermediate dimension derived from the ffn_down tensor's input dimension (ne[0]).
+        /// This is the ground truth from the tensor data, independent of GGUF metadata.
+        /// </summary>
+        public int ActualFfnHiddenDim { get; private set; }
+
+        /// <summary>
+        /// Actual fused QKV output dimension derived from the tensor's ne[1].
+        /// For MHA (Phi-3-mini): should be 3*dim. For GQA: dim + 2*kvDim.
+        /// </summary>
+        public int ActualQkvOutDim { get; private set; }
+
         public PhiWeights(MemoryMappedWeights weights, PhiConfig config)
         {
             int layers = config.LayerCount;
@@ -86,38 +98,92 @@ namespace ChatNet.Core.Models.Phi
 
             ResolveAll(weights, config);
 
-            // Debug: verify fused tensor dimensions for first layer
-            if (_hasFusedQkv || _hasFusedGateUp)
-            {
-                int dim = config.Dim;
-                int kvDim = config.KvDim;
-                int hiddenDim = config.HiddenDim;
+            // Derive actual dimensions from tensor shapes (ground truth, not metadata)
+            DeriveDimensionsFromTensors(weights, config);
+        }
 
-                if (_hasFusedQkv)
+        /// <summary>
+        /// Read actual tensor dimensions to derive the true FFN hidden dim and QKV output dim.
+        /// This ensures correctness even when GGUF metadata (feed_forward_length) is wrong or missing.
+        /// </summary>
+        private void DeriveDimensionsFromTensors(MemoryMappedWeights weights, PhiConfig config)
+        {
+            int dim = config.Dim;
+            int kvDim = config.KvDim;
+            int configHiddenDim = config.HiddenDim;
+
+            // Derive actual FFN hidden dim from ffn_down tensor's ne[0] (= intermediate_size)
+            string ffnDownName = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.FfnDownSuffix;
+            if (weights.HasTensor(ffnDownName))
+            {
+                var downInfo = weights.GetTensorInfo(ffnDownName);
+                if (downInfo.NDimensions >= 2)
                 {
-                    string qkvName = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.AttnQkvSuffix;
-                    if (weights.HasTensor(qkvName))
+                    ActualFfnHiddenDim = (int)downInfo.Dimensions[0];
+                    if (ActualFfnHiddenDim != configHiddenDim)
                     {
-                        var info = weights.GetTensorInfo(qkvName);
-                        ulong expectedOut = (ulong)(dim + kvDim + kvDim);
-                        Console.Error.WriteLine("[DEBUG] PhiWeights: QKV tensor dims=[" +
-                            info.Dimensions[0] + "," + info.Dimensions[1] + "]" +
-                            " expected=[" + dim + "," + expectedOut + "]" +
-                            " type=" + info.Type);
+                        Console.Error.WriteLine("[WARN] PhiWeights: config feed_forward_length=" + configHiddenDim +
+                            " but ffn_down tensor ne[0]=" + ActualFfnHiddenDim +
+                            ". GGUF metadata is WRONG. Using tensor-derived value " + ActualFfnHiddenDim + ".");
                     }
                 }
-
-                if (_hasFusedGateUp)
+                else
                 {
-                    string prefix0 = PhiTensorNames.BlockPrefix + "0";
-                    string fguName = prefix0 + PhiTensorNames.FfnGateUpSuffix;
-                    string fuName = prefix0 + PhiTensorNames.FfnUpSuffix;
-                    string tensorName = weights.HasTensor(fguName) ? fguName : fuName;
+                    ActualFfnHiddenDim = configHiddenDim;
+                }
+            }
+            else
+            {
+                ActualFfnHiddenDim = configHiddenDim;
+            }
+
+            // Derive actual QKV output dim from fused QKV tensor's ne[1]
+            if (_hasFusedQkv)
+            {
+                string qkvName = PhiTensorNames.BlockPrefix + "0" + PhiTensorNames.AttnQkvSuffix;
+                if (weights.HasTensor(qkvName))
+                {
+                    var qkvInfo = weights.GetTensorInfo(qkvName);
+                    if (qkvInfo.NDimensions >= 2)
+                    {
+                        ActualQkvOutDim = (int)qkvInfo.Dimensions[1];
+                        int expectedQkvDim = dim + kvDim + kvDim;
+                        if (ActualQkvOutDim != expectedQkvDim)
+                        {
+                            Console.Error.WriteLine("[WARN] PhiWeights: expected QKV outDim=" + expectedQkvDim +
+                                " (dim=" + dim + " + 2*kvDim=" + (kvDim * 2) + ")" +
+                                " but tensor ne[1]=" + ActualQkvOutDim +
+                                ". Using tensor-derived value.");
+                        }
+                    }
+                }
+            }
+
+            // Debug: print derived vs config dimensions
+            Console.Error.WriteLine("[DEBUG] PhiWeights: tensorDerived hiddenDim=" + ActualFfnHiddenDim +
+                " (config=" + configHiddenDim + ")" +
+                (ActualFfnHiddenDim != configHiddenDim ? " *** MISMATCH ***" : " OK"));
+
+            if (_hasFusedQkv && ActualQkvOutDim > 0)
+            {
+                Console.Error.WriteLine("[DEBUG] PhiWeights: tensorDerived qkvOutDim=" + ActualQkvOutDim +
+                    " (expected=" + (dim + kvDim + kvDim) + ")" +
+                    " type=" + AttnQkvType[0]);
+            }
+
+            if (_hasFusedGateUp)
+            {
+                string prefix0 = PhiTensorNames.BlockPrefix + "0";
+                string fguName = prefix0 + PhiTensorNames.FfnGateUpSuffix;
+                string fuName = prefix0 + PhiTensorNames.FfnUpSuffix;
+                string tensorName = weights.HasTensor(fguName) ? fguName : fuName;
+                if (weights.HasTensor(tensorName))
+                {
                     var info = weights.GetTensorInfo(tensorName);
-                    ulong expectedOut = (ulong)(hiddenDim * 2);
                     Console.Error.WriteLine("[DEBUG] PhiWeights: GateUp tensor '" + tensorName +
                         "' dims=[" + info.Dimensions[0] + "," + info.Dimensions[1] + "]" +
-                        " expected=[" + dim + "," + expectedOut + "]" +
+                        " actualHiddenDim=" + ActualFfnHiddenDim +
+                        " expected2x=" + (ActualFfnHiddenDim * 2) +
                         " type=" + info.Type);
                 }
             }

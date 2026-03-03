@@ -39,19 +39,53 @@ namespace ChatNet.Core.Models.Phi
         public ModelConfig Config => _modelConfig;
         public static bool DebugEnabled { get; set; }
 
+        // Effective FFN hidden dimension, derived from actual tensor shapes.
+        // This overrides _cfg.HiddenDim when GGUF metadata is wrong or missing.
+        private readonly int _effectiveHiddenDim;
+
+        // Effective fused QKV output dimension, derived from actual tensor shapes.
+        private readonly int _effectiveQkvDim;
+
         public PhiModel(ModelConfig modelConfig, PhiWeights weights)
         {
             _modelConfig = modelConfig;
             _cfg = new PhiConfig(modelConfig);
             _weights = weights;
 
+            // Use tensor-derived hiddenDim when it differs from config.
+            // The ffn_down tensor's ne[0] is the ground truth for intermediate_size.
+            _effectiveHiddenDim = weights.ActualFfnHiddenDim > 0
+                ? weights.ActualFfnHiddenDim
+                : _cfg.HiddenDim;
+
+            // Use tensor-derived QKV output dim when available
+            int configQkvDim = _cfg.Dim + _cfg.KvDim + _cfg.KvDim;
+            _effectiveQkvDim = (weights.HasFusedQkv && weights.ActualQkvOutDim > 0)
+                ? weights.ActualQkvOutDim
+                : configQkvDim;
+
+            if (_effectiveHiddenDim != _cfg.HiddenDim)
+            {
+                Console.Error.WriteLine("[WARN] PhiModel: overriding hiddenDim from " + _cfg.HiddenDim +
+                    " to " + _effectiveHiddenDim + " based on ffn_down tensor dimensions." +
+                    " GGUF metadata feed_forward_length is likely wrong or missing.");
+            }
+
+            if (_effectiveQkvDim != configQkvDim)
+            {
+                Console.Error.WriteLine("[WARN] PhiModel: overriding qkvDim from " + configQkvDim +
+                    " to " + _effectiveQkvDim + " based on attn_qkv tensor dimensions.");
+            }
+
             if (DebugEnabled)
             {
                 Console.Error.WriteLine("[DEBUG] PhiModel: arch=" + _modelConfig.Architecture +
-                    " dim=" + _cfg.Dim + " hiddenDim=" + _cfg.HiddenDim +
+                    " dim=" + _cfg.Dim + " hiddenDim=" + _effectiveHiddenDim +
+                    " (config=" + _cfg.HiddenDim + ")" +
                     " layers=" + _cfg.LayerCount + " vocab=" + _cfg.VocabSize);
                 Console.Error.WriteLine("[DEBUG] PhiModel: fusedQKV=" + weights.HasFusedQkv +
                     " fusedGateUp=" + weights.HasFusedGateUp +
+                    " qkvDim=" + _effectiveQkvDim + " (config=" + configQkvDim + ")" +
                     " rotaryDim=" + _cfg.RotaryDim + " headDim=" + _cfg.HeadDim +
                     " kvMul=" + _cfg.KvMul + " ropeBase=" + _cfg.RopeFreqBase +
                     " rmsEps=" + _cfg.RmsNormEps);
@@ -59,7 +93,7 @@ namespace ChatNet.Core.Models.Phi
                     " outType=" + weights.OutputType);
                 bool hasShort = _cfg.RopeScalingShortFactor != null;
                 bool hasLong = _cfg.RopeScalingLongFactor != null;
-                Console.Error.WriteLine("[DEBUG] PhiModel: ropeStyle=interleaved" +
+                Console.Error.WriteLine("[DEBUG] PhiModel: ropeStyle=neox" +
                     " SuScaledRoPE=" + (hasShort || hasLong) +
                     " shortFactors=" + (hasShort ? _cfg.RopeScalingShortFactor!.Length + " elems" : "none") +
                     " longFactors=" + (hasLong ? _cfg.RopeScalingLongFactor!.Length + " elems" : "none") +
@@ -100,7 +134,7 @@ namespace ChatNet.Core.Models.Phi
             int maxSeq = _cfg.ContextLength;
             int kvDim = _cfg.KvDim;
             int dim = _cfg.Dim;
-            int hiddenDim = _cfg.HiddenDim;
+            int hiddenDim = _effectiveHiddenDim;
 
             _keyCache = new float[_cfg.LayerCount * maxSeq * kvDim];
             _valueCache = new float[_cfg.LayerCount * maxSeq * kvDim];
@@ -110,8 +144,8 @@ namespace ChatNet.Core.Models.Phi
             _q = new float[dim];
             _k = new float[kvDim];
             _v = new float[kvDim];
-            // Fused QKV: output is [dim + kvDim + kvDim] = Q concat K concat V
-            _qkv = _weights.HasFusedQkv ? new float[dim + kvDim + kvDim] : Array.Empty<float>();
+            // Fused QKV: use tensor-derived output dimension
+            _qkv = _weights.HasFusedQkv ? new float[_effectiveQkvDim] : Array.Empty<float>();
             _attnOut = new float[dim];
             _gate = new float[hiddenDim];
             _up = new float[hiddenDim];
@@ -129,11 +163,11 @@ namespace ChatNet.Core.Models.Phi
             int nKvHeads = _cfg.KvHeadCount;
             int kvMul = _cfg.KvMul;
             int layers = _cfg.LayerCount;
-            int hiddenDim = _cfg.HiddenDim;
+            int hiddenDim = _effectiveHiddenDim;
             int vocabSize = _cfg.VocabSize;
             bool hasFusedQkv = _weights.HasFusedQkv;
             bool hasFusedGateUp = _weights.HasFusedGateUp;
-            int qkvDim = dim + kvDim + kvDim; // Total fused QKV output size
+            int qkvDim = _effectiveQkvDim; // Total fused QKV output size (tensor-derived)
 
             for (int t = 0; t < tokenIds.Length; t++)
             {
@@ -213,10 +247,10 @@ namespace ChatNet.Core.Models.Phi
                             "," + _q[2].ToString("F4") + "," + _q[3].ToString("F4") + "]");
                     }
 
-                    // Phi-3 GGUF: most converters (including llama.cpp) permute Q/K weights
-                    // for interleaved RoPE layout, same as Llama. Use ApplyRoPE (interleaved)
-                    // with partial rotation (rotaryDim = headDim/2 = 48).
-                    TensorMath.ApplyRoPE(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
+                    // Phi-3 GGUF: llama.cpp does NOT permute Q/K weights for Phi-3.
+                    // Weights are in original HuggingFace layout which uses neox-style
+                    // (split-half) RoPE with partial rotation (rotaryDim = headDim/2 = 48).
+                    TensorMath.ApplyRoPENeox(_q.AsSpan(0, dim), _k.AsSpan(0, kvDim),
                         pos, headDim, nHeads, nKvHeads, _cfg.RopeFreqBase, _cfg.RotaryDim);
 
                     if (DebugEnabled && pos == 0 && l == 0)
